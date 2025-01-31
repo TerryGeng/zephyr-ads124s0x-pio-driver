@@ -1,0 +1,93 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Copyright (c) 2022 TOKITA Hiroshi <tokita.hiroshi@fujitsu.com>
+ */
+
+/ {
+	zephyr,user {
+		// io-channels = <&adc 0>, <&adc_ads124s06 0>;
+		io-channels = <&adc_ads124s06 0>, <&adc_ads124s06 1>, <&adc_ads124s06 2>;
+        ads_gpios = <&ads124s06_gpio 0 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&adc {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,resolution = <12>;
+	};
+};
+
+&pinctrl {
+    	spi0_default: spi0_default {
+		group1 {
+			pinmux = <SPI0_CSN_P5>, <SPI0_SCK_P2>, <SPI0_TX_P3>;
+		};
+		group2 {
+			pinmux = <SPI0_RX_P4>;
+			input-enable;
+		};
+	};
+};
+
+&spi0 {
+    status = "ok";
+    cs-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;  // might be omitted since spi copntroller has a dedicated CSn pin
+    pinctrl-0 = <&spi0_default>;
+    pinctrl-names = "default";
+
+	adc_ads124s06: ads124s06@0 {
+		compatible = "ti,ads124s06-pio";
+
+        #io-channel-cells = <1>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+		reg = <0>;
+		spi-max-frequency = <1000000>;
+        drdy-gpios = <&gpio0 6 GPIO_ACTIVE_LOW>;
+
+        ads124s06_gpio: ads124s06_gpio {
+            compatible = "ti,ads1x4s0x-pio-gpio";
+            gpio-controller;
+            ngpios = <4>;
+            #gpio-cells = <2>;
+        };
+
+        channel@0 {
+            reg = <0>;
+            zephyr,gain = "ADC_GAIN_1";
+            zephyr,reference = "ADC_REF_INTERNAL";
+            zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+            zephyr,resolution = <24>;
+            zephyr,input-positive = <0>;
+            zephyr,input-negative = <1>;
+        };
+
+        channel@1 {
+            reg = <1>;
+            zephyr,gain = "ADC_GAIN_1";
+            zephyr,reference = "ADC_REF_INTERNAL";
+            zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+            zephyr,resolution = <24>;
+            zephyr,input-positive = <2>;
+            zephyr,input-negative = <3>;
+        };
+
+        channel@2 {
+            reg = <2>;
+            zephyr,gain = "ADC_GAIN_1";
+            zephyr,reference = "ADC_REF_INTERNAL";
+            zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+            zephyr,resolution = <24>;
+            zephyr,input-positive = <4>;
+            zephyr,input-negative = <5>;
+        };
+	};
+};
