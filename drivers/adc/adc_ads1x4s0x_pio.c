@@ -7,14 +7,20 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/adc/ads1x4s0x_pio.h>
-#include <zephyr/drivers/spi.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/pinctrl.h>
 #include <zephyr/dt-bindings/adc/ads1x4s0x_adc_pio.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/__assert.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
+
+#include <zephyr/drivers/misc/pio_rpi_pico/pio_rpi_pico.h>
+
+#include <hardware/pio.h>
+#include "hardware/clocks.h"
 
 #define ADS1X4S0X_HAS_16_BIT_DEV                                                                   \
 	(DT_HAS_COMPAT_STATUS_OKAY(ti_ads114s06_pio) || DT_HAS_COMPAT_STATUS_OKAY(ti_ads114s08_pio))
@@ -27,6 +33,263 @@
 #include "../../zephyr/drivers/adc/adc_context.h"
 
 LOG_MODULE_REGISTER(ads1x4s0x_pio, CONFIG_ADC_LOG_LEVEL);
+
+struct ads1x4s0x_pio_config {
+#if CONFIG_ADC_ASYNC
+	k_thread_stack_t *stack;
+#endif
+	const struct device *piodev;
+	const struct pinctrl_dev_config *pin_cfg;
+	struct gpio_dt_spec gpio_clk;
+	struct gpio_dt_spec gpio_mosi;
+	struct gpio_dt_spec gpio_miso;
+	struct gpio_dt_spec gpio_cs;
+	const struct device *clk_dev;
+	clock_control_subsys_t clk_id;
+	const uint32_t spi_freq;
+	const struct gpio_dt_spec gpio_reset;
+	const struct gpio_dt_spec gpio_data_ready;
+	const struct gpio_dt_spec gpio_start_sync;
+	int idac_current;
+	uint8_t vbias_level;
+	uint8_t channels;
+	uint8_t resolution;
+};
+
+struct ads1x4s0x_pio_data {
+	struct adc_context ctx;
+#if CONFIG_ADC_ASYNC
+	struct k_thread thread;
+#endif /* CONFIG_ADC_ASYNC */
+	PIO pio;
+	size_t pio_sm;
+    bool sm_configured;
+	struct gpio_callback callback_data_ready;
+	struct k_sem data_ready_signal;
+	struct k_sem acquire_signal;
+	void *buffer;
+	void *buffer_ptr;
+#if CONFIG_ADC_ADS1X4S0X_PIO_GPIO
+	struct k_mutex gpio_lock;
+	uint8_t gpio_enabled;   /* one bit per GPIO, 1 = enabled */
+	uint8_t gpio_direction; /* one bit per GPIO, 1 = input */
+	uint8_t gpio_value;     /* one bit per GPIO, 1 = high */
+#endif                          /* CONFIG_ADC_ADS1X4S0X_GPIO */
+};
+
+/*############################################################*/
+/*                        SPI via PIO                         */
+/*############################################################*/
+
+#define PIO_CYCLES     (4)
+#define PIO_FIFO_DEPTH (4)
+
+#define SPI_MODE_0_1_WRAP_TARGET 0
+#define SPI_MODE_0_1_WRAP        2
+#define SPI_MODE_0_1_CYCLES      4
+
+RPI_PICO_PIO_DEFINE_PROGRAM(spi_mode_0_1, SPI_MODE_0_1_WRAP_TARGET, SPI_MODE_0_1_WRAP,
+			    /*     .wrap_target */
+			    0x6021,   /* 0: out    x, 1            side 0 */
+			    0xb101,   /* 1: mov    pins, x         side 1 [1] */
+			    0x4001,   /* in     pins, 1         side 0 */
+				      /*     .wrap */
+);
+
+static float spi_pico_pio_clock_divisor(uint32_t clock_freq, uint32_t spi_frequency)
+{
+	return (float)clock_freq / (float)(PIO_CYCLES * spi_frequency);
+}
+
+static uint32_t spi_pico_pio_maximum_clock_frequency(uint32_t clock_freq)
+{
+	return clock_freq / PIO_CYCLES;
+}
+
+static uint32_t spi_pico_pio_minimum_clock_frequency(uint32_t clock_freq)
+{
+	return clock_freq / (PIO_CYCLES * 65536);
+}
+
+static inline void spi_pico_pio_sm_put8(PIO pio, uint sm, uint8_t data)
+{
+	/* Do 8 bit accesses on FIFO, so that write data is byte-replicated. This */
+	/* gets us the left-justification for free (for MSB-first shift-out) */
+	io_rw_8 *txfifo = (io_rw_8 *)&pio->txf[sm];
+
+	*txfifo = data;
+}
+
+static inline uint8_t spi_pico_pio_sm_get8(PIO pio, uint sm)
+{
+	/* Do 8 bit accesses on FIFO, so that write data is byte-replicated. This */
+	/* gets us the left-justification for free (for MSB-first shift-out) */
+	io_rw_8 *rxfifo = (io_rw_8 *)&pio->rxf[sm];
+
+	return *rxfifo;
+}
+
+static int spi_pico_pio_configure(const struct ads1x4s0x_pio_config *dev_cfg,
+				  struct ads1x4s0x_pio_data *data)
+{
+	const struct gpio_dt_spec *miso;
+	const struct gpio_dt_spec *mosi;
+	const struct gpio_dt_spec *clk;
+	pio_sm_config sm_config;
+	uint32_t offset;
+	uint32_t wrap_target;
+	uint32_t wrap;
+	uint32_t bits = 8;
+    uint32_t clock_freq;
+	const pio_program_t *program;
+	int rc;
+
+    if (data->sm_configured) {
+        return 0;
+    }
+
+	rc = clock_control_on(dev_cfg->clk_dev, dev_cfg->clk_id);
+	if (rc < 0) {
+		LOG_ERR("Failed to enable the clock");
+		return rc;
+	}
+
+	rc = clock_control_get_rate(dev_cfg->clk_dev, dev_cfg->clk_id, &clock_freq);
+	if (rc < 0) {
+		LOG_ERR("Failed to get clock frequency");
+		return rc;
+	}
+
+	if ((dev_cfg->spi_freq < spi_pico_pio_minimum_clock_frequency(clock_freq)) ||
+	    (dev_cfg->spi_freq > spi_pico_pio_maximum_clock_frequency(clock_freq))) {
+		LOG_ERR("clock-frequency out of range");
+		return -EINVAL;
+	}
+
+	float clock_div = spi_pico_pio_clock_divisor(clock_freq, dev_cfg->spi_freq);
+
+	mosi = &dev_cfg->gpio_mosi;
+	miso = &dev_cfg->gpio_miso;
+	clk = &dev_cfg->gpio_clk;
+	data->pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
+	rc = pio_rpi_pico_allocate_sm(dev_cfg->piodev, &data->pio_sm);
+	if (rc < 0) {
+		return rc;
+	}
+
+    program = RPI_PICO_PIO_GET_PROGRAM(spi_mode_0_1);
+    wrap_target = RPI_PICO_PIO_GET_WRAP_TARGET(spi_mode_0_1);
+    wrap = RPI_PICO_PIO_GET_WRAP(spi_mode_0_1);
+
+	if (!pio_can_add_program(data->pio, program)) {
+		return -EBUSY;
+	}
+
+	offset = pio_add_program(data->pio, program);
+	sm_config = pio_get_default_sm_config();
+
+	sm_config_set_clkdiv(&sm_config, clock_div);
+	sm_config_set_in_pins(&sm_config, miso->pin);
+	sm_config_set_in_shift(&sm_config, false, true, bits);
+	sm_config_set_out_pins(&sm_config, mosi->pin, 1);
+	sm_config_set_out_shift(&sm_config, false, true, bits);
+	sm_config_set_sideset_pins(&sm_config, clk->pin);
+	sm_config_set_sideset(&sm_config, 1, false, false);
+	sm_config_set_wrap(&sm_config, offset + wrap_target, offset + wrap);
+
+	pio_sm_set_consecutive_pindirs(data->pio, data->pio_sm, miso->pin, 1, false);
+	pio_sm_set_pindirs_with_mask(data->pio, data->pio_sm, (BIT(clk->pin) | BIT(mosi->pin)),
+				     (BIT(clk->pin) | BIT(mosi->pin)));
+	pio_sm_set_pins_with_mask(data->pio, data->pio_sm, 0,
+				  BIT(clk->pin) | BIT(mosi->pin));
+	pio_gpio_init(data->pio, mosi->pin);
+	pio_gpio_init(data->pio, miso->pin);
+	pio_gpio_init(data->pio, clk->pin);
+
+    gpio_pin_set_dt(&dev_cfg->gpio_cs, GPIO_OUTPUT_ACTIVE);
+
+	pio_sm_init(data->pio, data->pio_sm, offset, &sm_config);
+	pio_sm_set_enabled(data->pio, data->pio_sm, true);
+
+    data->sm_configured = true;
+
+	return 0;
+}
+
+static int spi_pico_pio_transceive(const struct device *dev,
+					const uint8_t *txbuf, uint8_t *rxbuf, size_t len)
+{
+	const struct ads1x4s0x_pio_config *dev_cfg = dev->config;
+	struct ads1x4s0x_pio_data *data = dev->data;
+	uint32_t txrx;
+	size_t fifo_cnt = 0;
+    size_t tx_count = 0;
+    size_t rx_count = 0;
+	int rc = 0;
+
+	rc = spi_pico_pio_configure(dev_cfg, data);
+	if (rc < 0) {
+        return rc;
+	}
+
+	pio_sm_clear_fifos(data->pio, data->pio_sm);
+
+	while (rx_count < len || tx_count < len) {
+		/* Fill up fifo with available TX data */
+		while ((!pio_sm_is_tx_fifo_full(data->pio, data->pio_sm)) &&
+		       tx_count < len && fifo_cnt < PIO_FIFO_DEPTH) {
+			/* Send 0 in the case of read only operation */
+			txrx = 0;
+
+			if (txbuf) {
+				txrx = ((uint8_t *)txbuf)[tx_count];
+			}
+			spi_pico_pio_sm_put8(data->pio, data->pio_sm, txrx);
+			tx_count++;
+			fifo_cnt++;
+		}
+
+		while ((!pio_sm_is_rx_fifo_empty(data->pio, data->pio_sm)) &&
+		       rx_count < len && fifo_cnt > 0) {
+			txrx = spi_pico_pio_sm_get8(data->pio, data->pio_sm);
+
+			/* Discard received data if rx buffer not assigned */
+			if (rxbuf) {
+				((uint8_t *)rxbuf)[rx_count] = (uint8_t)txrx;
+			}
+			rx_count++;
+			fifo_cnt--;
+		}
+	}
+
+    gpio_pin_set_dt(&dev_cfg->gpio_cs, GPIO_OUTPUT_INACTIVE);
+
+	return rc;
+}
+
+static int spi_pico_pio_init(const struct device *dev)
+{
+	const struct ads1x4s0x_pio_config *dev_cfg = dev->config;
+	int rc;
+
+	rc = pinctrl_apply_state(dev_cfg->pin_cfg, PINCTRL_STATE_DEFAULT);
+	if (rc) {
+		LOG_ERR("Failed to apply pinctrl state");
+		return rc;
+	}
+
+    rc = gpio_pin_configure_dt(&dev_cfg->gpio_cs, GPIO_OUTPUT_INACTIVE);
+	if (rc) {
+		LOG_ERR("Failed to initialize cs pin");
+		return rc;
+	}
+
+	return 0;
+}
+
+/*############################################################*/
+/*                     End of SPI via PIO                     */
+/*############################################################*/
 
 #define ADS1X4S0X_CLK_FREQ_IN_KHZ                           4096
 #define ADS1X4S0X_RESET_LOW_TIME_IN_CLOCK_CYCLES            4
@@ -421,38 +684,6 @@ enum ads1x4s0x_pio_register {
 	ADS1X4S0X_REGISTER_IDACMUX_I1MUX_SET(target, 0b1111);                                      \
 	ADS1X4S0X_REGISTER_IDACMUX_I2MUX_SET(target, 0b1111)
 
-struct ads1x4s0x_pio_config {
-	struct spi_dt_spec bus;
-#if CONFIG_ADC_ASYNC
-	k_thread_stack_t *stack;
-#endif
-	const struct gpio_dt_spec gpio_reset;
-	const struct gpio_dt_spec gpio_data_ready;
-	const struct gpio_dt_spec gpio_start_sync;
-	int idac_current;
-	uint8_t vbias_level;
-	uint8_t channels;
-	uint8_t resolution;
-};
-
-struct ads1x4s0x_pio_data {
-	struct adc_context ctx;
-#if CONFIG_ADC_ASYNC
-	struct k_thread thread;
-#endif /* CONFIG_ADC_ASYNC */
-	struct gpio_callback callback_data_ready;
-	struct k_sem data_ready_signal;
-	struct k_sem acquire_signal;
-	void *buffer;
-	void *buffer_ptr;
-#if CONFIG_ADC_ADS1X4S0X_PIO_GPIO
-	struct k_mutex gpio_lock;
-	uint8_t gpio_enabled;   /* one bit per GPIO, 1 = enabled */
-	uint8_t gpio_direction; /* one bit per GPIO, 1 = input */
-	uint8_t gpio_value;     /* one bit per GPIO, 1 = high */
-#endif                          /* CONFIG_ADC_ADS1X4S0X_GPIO */
-};
-
 static void ads1x4s0x_pio_data_ready_handler(const struct device *dev, struct gpio_callback *gpio_cb,
 					 uint32_t pins)
 {
@@ -468,34 +699,17 @@ static void ads1x4s0x_pio_data_ready_handler(const struct device *dev, struct gp
 static int ads1x4s0x_pio_read_register(const struct device *dev,
 				   enum ads1x4s0x_pio_register register_address, uint8_t *value)
 {
-	const struct ads1x4s0x_pio_config *config = dev->config;
 	uint8_t buffer_tx[3];
-	uint8_t buffer_rx[ARRAY_SIZE(buffer_tx)];
-	const struct spi_buf tx_buf[] = {{
-		.buf = buffer_tx,
-		.len = ARRAY_SIZE(buffer_tx),
-	}};
-	const struct spi_buf rx_buf[] = {{
-		.buf = buffer_rx,
-		.len = ARRAY_SIZE(buffer_rx),
-	}};
-	const struct spi_buf_set tx = {
-		.buffers = tx_buf,
-		.count = ARRAY_SIZE(tx_buf),
-	};
-	const struct spi_buf_set rx = {
-		.buffers = rx_buf,
-		.count = ARRAY_SIZE(rx_buf),
-	};
+	uint8_t buffer_rx[3];
 
 	buffer_tx[0] = ((uint8_t)ADS1X4S0X_COMMAND_RREG) | ((uint8_t)register_address);
 	/* read one register */
 	buffer_tx[1] = 0x00;
 
-	int result = spi_transceive_dt(&config->bus, &tx, &rx);
+	int result = spi_pico_pio_transceive(dev, buffer_tx, buffer_rx, 3);
 
 	if (result != 0) {
-		LOG_ERR("%s: spi_transceive failed with error %i", dev->name, result);
+		LOG_ERR("%s: spi_pico_pio_transceive failed with error %i", dev->name, result);
 		return result;
 	}
 
@@ -508,16 +722,7 @@ static int ads1x4s0x_pio_read_register(const struct device *dev,
 static int ads1x4s0x_pio_write_register(const struct device *dev,
 				    enum ads1x4s0x_pio_register register_address, uint8_t value)
 {
-	const struct ads1x4s0x_pio_config *config = dev->config;
 	uint8_t buffer_tx[3];
-	const struct spi_buf tx_buf[] = {{
-		.buf = buffer_tx,
-		.len = ARRAY_SIZE(buffer_tx),
-	}};
-	const struct spi_buf_set tx = {
-		.buffers = tx_buf,
-		.count = ARRAY_SIZE(tx_buf),
-	};
 
 	buffer_tx[0] = ((uint8_t)ADS1X4S0X_COMMAND_WREG) | ((uint8_t)register_address);
 	/* write one register */
@@ -525,7 +730,7 @@ static int ads1x4s0x_pio_write_register(const struct device *dev,
 	buffer_tx[2] = value;
 
 	LOG_DBG("%s: writing to register 0x%02X value 0x%02X", dev->name, register_address, value);
-	int result = spi_write_dt(&config->bus, &tx);
+	int result = spi_pico_pio_transceive(dev, buffer_tx, NULL, 3);
 
 	if (result != 0) {
 		LOG_ERR("%s: spi_write failed with error %i", dev->name, result);
@@ -539,22 +744,8 @@ static int ads1x4s0x_pio_write_multiple_registers(const struct device *dev,
 					      enum ads1x4s0x_pio_register *register_addresses,
 					      uint8_t *values, size_t count)
 {
-	const struct ads1x4s0x_pio_config *config = dev->config;
-	uint8_t buffer_tx[2];
-	const struct spi_buf tx_buf[] = {
-		{
-			.buf = buffer_tx,
-			.len = ARRAY_SIZE(buffer_tx),
-		},
-		{
-			.buf = values,
-			.len = count,
-		},
-	};
-	const struct spi_buf_set tx = {
-		.buffers = tx_buf,
-		.count = ARRAY_SIZE(tx_buf),
-	};
+	uint8_t buffer_tx[32];
+    int result;
 
 	if (count == 0) {
 		LOG_WRN("%s: ignoring the command to write 0 registers", dev->name);
@@ -563,6 +754,8 @@ static int ads1x4s0x_pio_write_multiple_registers(const struct device *dev,
 
 	buffer_tx[0] = ((uint8_t)ADS1X4S0X_COMMAND_WREG) | ((uint8_t)register_addresses[0]);
 	buffer_tx[1] = count - 1;
+
+    memcpy(buffer_tx + 2, values, count);
 
 	LOG_HEXDUMP_DBG(register_addresses, count, "writing to registers");
 	LOG_HEXDUMP_DBG(values, count, "values");
@@ -573,7 +766,7 @@ static int ads1x4s0x_pio_write_multiple_registers(const struct device *dev,
 			 "register addresses are not consecutive");
 	}
 
-	int result = spi_write_dt(&config->bus, &tx);
+	result = spi_pico_pio_transceive(dev, buffer_tx, NULL, count + 2);
 
 	if (result != 0) {
 		LOG_ERR("%s: spi_write failed with error %i", dev->name, result);
@@ -585,21 +778,12 @@ static int ads1x4s0x_pio_write_multiple_registers(const struct device *dev,
 
 static int ads1x4s0x_pio_send_command(const struct device *dev, enum ads1x4s0x_pio_command command)
 {
-	const struct ads1x4s0x_pio_config *config = dev->config;
 	uint8_t buffer_tx[1];
-	const struct spi_buf tx_buf[] = {{
-		.buf = buffer_tx,
-		.len = ARRAY_SIZE(buffer_tx),
-	}};
-	const struct spi_buf_set tx = {
-		.buffers = tx_buf,
-		.count = ARRAY_SIZE(tx_buf),
-	};
 
 	buffer_tx[0] = (uint8_t)command;
 
 	LOG_DBG("%s: sending command 0x%02X", dev->name, command);
-	int result = spi_write_dt(&config->bus, &tx);
+	int result = spi_pico_pio_transceive(dev, buffer_tx, NULL, 1);
 
 	if (result != 0) {
 		LOG_ERR("%s: spi_write failed with error %i", dev->name, result);
@@ -1014,30 +1198,14 @@ static int ads1x4s0x_pio_read_sample_16(const struct device *dev, int16_t *buffe
 {
 	const struct ads1x4s0x_pio_config *config = dev->config;
 	uint8_t buffer_tx[3];
-	uint8_t buffer_rx[ARRAY_SIZE(buffer_tx)];
-	const struct spi_buf tx_buf[] = {{
-		.buf = buffer_tx,
-		.len = 3,
-	}};
-	const struct spi_buf rx_buf[] = {{
-		.buf = buffer_rx,
-		.len = 3,
-	}};
-	const struct spi_buf_set tx = {
-		.buffers = tx_buf,
-		.count = ARRAY_SIZE(tx_buf),
-	};
-	const struct spi_buf_set rx = {
-		.buffers = rx_buf,
-		.count = ARRAY_SIZE(rx_buf),
-	};
+	uint8_t buffer_rx[3];
 
 	buffer_tx[0] = (uint8_t)ADS1X4S0X_COMMAND_RDATA;
 
-	int result = spi_transceive_dt(&config->bus, &tx, &rx);
+	int result = spi_pico_pio_transceive(dev, buffer_tx, buffer_rx, 3);
 
 	if (result != 0) {
-		LOG_ERR("%s: spi_transceive failed with error %i", dev->name, result);
+		LOG_ERR("%s: spi_pico_pio_transceive failed with error %i", dev->name, result);
 		return result;
 	}
 
@@ -1051,32 +1219,15 @@ static int ads1x4s0x_pio_read_sample_16(const struct device *dev, int16_t *buffe
 #if ADS1X4S0X_HAS_24_BIT_DEV
 static int ads1x4s0x_pio_read_sample_24(const struct device *dev, int32_t *buffer)
 {
-	const struct ads1x4s0x_pio_config *config = dev->config;
-	uint8_t buffer_tx[5] = {0};
-	uint8_t buffer_rx[ARRAY_SIZE(buffer_tx)];
-	const struct spi_buf tx_buf[] = {{
-		.buf = buffer_tx,
-		.len = 4,
-	}};
-	const struct spi_buf rx_buf[] = {{
-		.buf = buffer_rx,
-		.len = 4,
-	}};
-	const struct spi_buf_set tx = {
-		.buffers = tx_buf,
-		.count = ARRAY_SIZE(tx_buf),
-	};
-	const struct spi_buf_set rx = {
-		.buffers = rx_buf,
-		.count = ARRAY_SIZE(rx_buf),
-	};
+	uint8_t buffer_tx[4] = {0};
+	uint8_t buffer_rx[5] = {0};
 
 	buffer_tx[0] = (uint8_t)ADS1X4S0X_COMMAND_RDATA;
 
-	int result = spi_transceive_dt(&config->bus, &tx, &rx);
+	int result = spi_pico_pio_transceive(dev, buffer_tx, buffer_rx, 4);
 
 	if (result != 0) {
-		LOG_ERR("%s: spi_transceive failed with error %i", dev->name, result);
+		LOG_ERR("%s: spi_pico_pio_transceive failed with error %i", dev->name, result);
 		return result;
 	}
 
@@ -1436,8 +1587,8 @@ static int ads1x4s0x_pio_init(const struct device *dev)
 	k_mutex_init(&data->gpio_lock);
 #endif /* CONFIG_ADC_ADS1X4S0X_GPIO */
 
-	if (!spi_is_ready_dt(&config->bus)) {
-		LOG_ERR("%s: SPI device is not ready", dev->name);
+	if (spi_pico_pio_init(dev) != 0) {
+		LOG_ERR("%s: Failed to initialize SPI vio PIO", dev->name);
 		return -ENODEV;
 	}
 
@@ -1574,10 +1725,18 @@ BUILD_ASSERT(CONFIG_ADC_INIT_PRIORITY > CONFIG_SPI_INIT_PRIORITY,
 			 thread_stack_##name##_##n,                                               \
 			 CONFIG_ADC_ADS1X4S0X_ACQUISITION_THREAD_STACK_SIZE);)                    \
 	)                                                                                         \
+	PINCTRL_DT_INST_DEFINE(n);                                                             \
 	static const struct ads1x4s0x_pio_config config_##name##_##n = {                              \
-		.bus = SPI_DT_SPEC_INST_GET(                                                      \
-			n, SPI_OP_MODE_MASTER | SPI_MODE_CPHA | SPI_WORD_SET(8), 0),              \
 		IF_ENABLED(CONFIG_ADC_ASYNC, (.stack = thread_stack_##n,))                        \
+		.piodev = DEVICE_DT_GET(DT_INST_PARENT(n)), \
+		.pin_cfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n), \
+		.gpio_clk = GPIO_DT_SPEC_INST_GET(n, clk_gpios), \
+		.gpio_mosi = GPIO_DT_SPEC_INST_GET_OR(n, mosi_gpios, {0}), \
+		.gpio_miso = GPIO_DT_SPEC_INST_GET_OR(n, miso_gpios, {0}), \
+		.gpio_cs = GPIO_DT_SPEC_INST_GET_OR(n, cs_gpios, {0}), \
+		.clk_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(n)),                               \
+		.clk_id = (clock_control_subsys_t)DT_INST_PHA_BY_IDX(n, clocks, 0, clk_id),     \
+		.spi_freq = DT_INST_PROP_OR(n, spi_frequency, MHZ(1)), \
 		.gpio_reset = GPIO_DT_SPEC_INST_GET_OR(n, reset_gpios, {0}),                      \
 		.gpio_data_ready = GPIO_DT_SPEC_INST_GET(n, drdy_gpios),                          \
 		.gpio_start_sync = GPIO_DT_SPEC_INST_GET_OR(n, start_sync_gpios, {0}),            \
@@ -1589,7 +1748,10 @@ BUILD_ASSERT(CONFIG_ADC_INIT_PRIORITY > CONFIG_SPI_INIT_PRIORITY,
 	};                                                                                        \
 	static struct ads1x4s0x_pio_data data_##name##_##n;                                           \
 	DEVICE_DT_INST_DEFINE(n, ads1x4s0x_pio_init, NULL, &data_##name##_##n, &config_##name##_##n,  \
-			      POST_KERNEL, CONFIG_ADC_INIT_PRIORITY, &api);
+			      POST_KERNEL, CONFIG_ADC_INIT_PRIORITY, &api); \
+	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, clk_gpios)); \
+	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, mosi_gpios)); \
+	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, miso_gpios));
 
 /*
  * ADS114S06: 16 bit, 6 channels

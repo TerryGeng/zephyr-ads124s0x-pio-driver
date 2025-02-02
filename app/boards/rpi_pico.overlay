@@ -6,8 +6,8 @@
 
 / {
 	zephyr,user {
-		// io-channels = <&adc 0>, <&adc_ads124s06 0>;
-		io-channels = <&adc_ads124s06 0>, <&adc_ads124s06 1>, <&adc_ads124s06 2>;
+		// io-channels = <&adc 0>, <&adc_ads124s06_pio 0>;
+		io-channels = <&adc_ads124s06_pio 0>, <&adc_ads124s06_pio 1>, <&adc_ads124s06_pio 2>;
         ads_gpios = <&ads124s06_gpio 0 GPIO_ACTIVE_HIGH>;
 	};
 };
@@ -26,7 +26,7 @@
 };
 
 &pinctrl {
-	pio0_spi0_default: pio0_spi0_default {
+    pio0_spi0_default: pio0_spi0_default {
 		group1 {
 			pinmux = <PIO0_P2>, <PIO0_P3>;
 		};
@@ -40,66 +40,66 @@
 &pio0 {
 	status = "okay";
 
-	pio0_spi0: pio0_spi0 {
-		pinctrl-0 = <&pio0_spi0_default>;
-		pinctrl-names = "default";
+    #io-channel-cells = <1>;
+    #address-cells = <1>;
+    #size-cells = <0>;
 
-		compatible = "raspberrypi,pico-spi-pio";
+	adc_ads124s06_pio: ads124s06_pio@0 {
+        pinctrl-0 = <&pio0_spi0_default>;
+        pinctrl-names = "default";
+
+		compatible = "ti,ads124s06-pio";
 		status = "okay";
-		#address-cells = <1>;
-		#size-cells = <0>;
-		clocks = <&clocks RPI_PICO_CLKID_CLK_SYS>;
+        reg = <0>;
+
 		miso-gpios = <&gpio0 4 0>;
 		cs-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
 		clk-gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
 		mosi-gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;
+		clocks = <&clocks RPI_PICO_CLKID_CLK_SYS>;
+		spi-frequency = <1000000>;
 
-        adc_ads124s06: ads124s06@0 {
-            compatible = "ti,ads124s06-pio";
+        drdy-gpios = <&gpio0 6 GPIO_ACTIVE_LOW>;
 
-            #io-channel-cells = <1>;
-            #address-cells = <1>;
-            #size-cells = <0>;
+        #io-channel-cells = <1>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        ads124s06_gpio: ads124s06_gpio {
+            compatible = "ti,ads1x4s0x-pio-gpio";
+            gpio-controller;
+            ngpios = <4>;
+            #gpio-cells = <2>;
+        };
+
+        channel@0 {
             reg = <0>;
-            spi-max-frequency = <1000000>;
-            drdy-gpios = <&gpio0 6 GPIO_ACTIVE_LOW>;
+            zephyr,gain = "ADC_GAIN_1";
+            zephyr,reference = "ADC_REF_INTERNAL";
+            zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+            zephyr,resolution = <24>;
+            zephyr,input-positive = <0>;
+            zephyr,input-negative = <1>;
+        };
 
-            ads124s06_gpio: ads124s06_gpio {
-                compatible = "ti,ads1x4s0x-pio-gpio";
-                gpio-controller;
-                ngpios = <4>;
-                #gpio-cells = <2>;
-            };
+        channel@1 {
+            reg = <1>;
+            zephyr,gain = "ADC_GAIN_1";
+            zephyr,reference = "ADC_REF_INTERNAL";
+            zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+            zephyr,resolution = <24>;
+            zephyr,input-positive = <2>;
+            zephyr,input-negative = <3>;
+        };
 
-            channel@0 {
-                reg = <0>;
-                zephyr,gain = "ADC_GAIN_1";
-                zephyr,reference = "ADC_REF_INTERNAL";
-                zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
-                zephyr,resolution = <24>;
-                zephyr,input-positive = <0>;
-                zephyr,input-negative = <1>;
-            };
-
-            channel@1 {
-                reg = <1>;
-                zephyr,gain = "ADC_GAIN_1";
-                zephyr,reference = "ADC_REF_INTERNAL";
-                zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
-                zephyr,resolution = <24>;
-                zephyr,input-positive = <2>;
-                zephyr,input-negative = <3>;
-            };
-
-            channel@2 {
-                reg = <2>;
-                zephyr,gain = "ADC_GAIN_1";
-                zephyr,reference = "ADC_REF_INTERNAL";
-                zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
-                zephyr,resolution = <24>;
-                zephyr,input-positive = <4>;
-                zephyr,input-negative = <5>;
-            };
+        channel@2 {
+            reg = <2>;
+            zephyr,gain = "ADC_GAIN_1";
+            zephyr,reference = "ADC_REF_INTERNAL";
+            zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+            zephyr,resolution = <24>;
+            zephyr,input-positive = <4>;
+            zephyr,input-negative = <5>;
         };
 	};
 };
