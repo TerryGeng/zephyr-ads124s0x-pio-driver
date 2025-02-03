@@ -81,34 +81,47 @@ struct ads1x4s0x_pio_data {
 /*                        SPI via PIO                         */
 /*############################################################*/
 
-#define PIO_CYCLES     (4)
-#define PIO_FIFO_DEPTH (4)
+#define SPI_ODM_MODE_0_1_WRAP_TARGET      2
+#define SPI_ODM_MODE_0_1_WRAP             12
+#define SPI_ODM_MODE_0_1_CYCLES           12
+#define SPI_ODM_MODE_0_1_OFFSET_WAIT_INST 1
+#define SPI_ODM_MODE_0_1_ENTRY_POINT      2
 
-#define SPI_MODE_0_1_WRAP_TARGET 0
-#define SPI_MODE_0_1_WRAP        2
-#define SPI_MODE_0_1_CYCLES      4
+/* ------------------------- */
+/* SPI on-demand pio program */
+/* ------------------------- */
 
-RPI_PICO_PIO_DEFINE_PROGRAM(spi_mode_0_1, SPI_MODE_0_1_WRAP_TARGET, SPI_MODE_0_1_WRAP,
-			    /*     .wrap_target */
-			    0x6021,   /* 0: out    x, 1            side 0 */
-			    0xb101,   /* 1: mov    pins, x         side 1 [1] */
-			    0x4001,   /* in     pins, 1         side 0 */
-				      /*     .wrap */
+RPI_PICO_PIO_DEFINE_PROGRAM(spi_odm_mode_0_1, SPI_ODM_MODE_0_1_WRAP_TARGET, SPI_ODM_MODE_0_1_WRAP,
+    0x6021, /*  0: out    x, 1            side 0 */
+    0x2006, /*  1: wait   0 gpio, 6       side 0 */
+            /*     .wrap_target */
+    0x6021, /*  2: out    x, 1            side 0 */
+    0x0026, /*  3: jmp    !x, 6           side 0 */
+    0x6023, /*  4: out    x, 3            side 0 */
+    0x0002, /*  5: jmp    2               side 0 */
+    0x6021, /*  6: out    x, 1            side 0 */
+    0x6041, /*  7: out    y, 1            side 0 */
+    0x0020, /*  8: jmp    !x, 0           side 0 */
+    0x7401, /*  9: out    pins, 1         side 1 [4] */
+    0x106c, /* 10: jmp    !y, 12          side 1 */
+    0x0002, /* 11: jmp    2               side 0 */
+    0x4001, /* 12: in     pins, 1         side 0 */
+            /*     .wrap */
 );
 
-static float spi_pico_pio_clock_divisor(uint32_t clock_freq, uint32_t spi_frequency)
+static float spi_pico_pio_clock_divisor(uint32_t clock_freq, uint8_t cycles, uint32_t spi_frequency)
 {
-	return (float)clock_freq / (float)(PIO_CYCLES * spi_frequency);
+	return (float)clock_freq / (float)(cycles * spi_frequency);
 }
 
-static uint32_t spi_pico_pio_maximum_clock_frequency(uint32_t clock_freq)
+static uint32_t spi_pico_pio_maximum_clock_frequency(uint32_t clock_freq, uint8_t cycles)
 {
-	return clock_freq / PIO_CYCLES;
+	return clock_freq / cycles;
 }
 
-static uint32_t spi_pico_pio_minimum_clock_frequency(uint32_t clock_freq)
+static uint32_t spi_pico_pio_minimum_clock_frequency(uint32_t clock_freq, uint8_t cycles)
 {
-	return clock_freq / (PIO_CYCLES * 65536);
+	return clock_freq / (cycles * 65536);
 }
 
 static inline void spi_pico_pio_sm_put8(PIO pio, uint sm, uint8_t data)
@@ -135,11 +148,12 @@ static int spi_pico_pio_configure(const struct ads1x4s0x_pio_config *dev_cfg,
 	const struct gpio_dt_spec *miso;
 	const struct gpio_dt_spec *mosi;
 	const struct gpio_dt_spec *clk;
+	const struct gpio_dt_spec *drdy;
 	pio_sm_config sm_config;
 	uint32_t offset;
 	uint32_t wrap_target;
 	uint32_t wrap;
-	uint32_t bits = 8;
+	uint32_t entry_point;
     uint32_t clock_freq;
 	const pio_program_t *program;
 	int rc;
@@ -160,39 +174,44 @@ static int spi_pico_pio_configure(const struct ads1x4s0x_pio_config *dev_cfg,
 		return rc;
 	}
 
-	if ((dev_cfg->spi_freq < spi_pico_pio_minimum_clock_frequency(clock_freq)) ||
-	    (dev_cfg->spi_freq > spi_pico_pio_maximum_clock_frequency(clock_freq))) {
+	if ((dev_cfg->spi_freq < spi_pico_pio_minimum_clock_frequency(clock_freq, SPI_ODM_MODE_0_1_CYCLES)) ||
+	    (dev_cfg->spi_freq > spi_pico_pio_maximum_clock_frequency(clock_freq, SPI_ODM_MODE_0_1_CYCLES))) {
 		LOG_ERR("clock-frequency out of range");
 		return -EINVAL;
 	}
 
-	float clock_div = spi_pico_pio_clock_divisor(clock_freq, dev_cfg->spi_freq);
+	float clock_div = spi_pico_pio_clock_divisor(clock_freq, SPI_ODM_MODE_0_1_CYCLES, dev_cfg->spi_freq);
 
 	mosi = &dev_cfg->gpio_mosi;
 	miso = &dev_cfg->gpio_miso;
 	clk = &dev_cfg->gpio_clk;
+	drdy = &dev_cfg->gpio_data_ready;
 	data->pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
 	rc = pio_rpi_pico_allocate_sm(dev_cfg->piodev, &data->pio_sm);
 	if (rc < 0) {
 		return rc;
 	}
 
-    program = RPI_PICO_PIO_GET_PROGRAM(spi_mode_0_1);
-    wrap_target = RPI_PICO_PIO_GET_WRAP_TARGET(spi_mode_0_1);
-    wrap = RPI_PICO_PIO_GET_WRAP(spi_mode_0_1);
+    program = RPI_PICO_PIO_GET_PROGRAM(spi_odm_mode_0_1);
+    wrap_target = RPI_PICO_PIO_GET_WRAP_TARGET(spi_odm_mode_0_1);
+    wrap = RPI_PICO_PIO_GET_WRAP(spi_odm_mode_0_1);
+    entry_point = SPI_ODM_MODE_0_1_ENTRY_POINT;
 
 	if (!pio_can_add_program(data->pio, program)) {
 		return -EBUSY;
 	}
 
 	offset = pio_add_program(data->pio, program);
+    data->pio->instr_mem[offset + SPI_ODM_MODE_0_1_OFFSET_WAIT_INST] = \
+        0x2000 | drdy->pin;   /* wait for data ready to be set high */
+
 	sm_config = pio_get_default_sm_config();
 
 	sm_config_set_clkdiv(&sm_config, clock_div);
 	sm_config_set_in_pins(&sm_config, miso->pin);
-	sm_config_set_in_shift(&sm_config, false, true, bits);
+	sm_config_set_in_shift(&sm_config, false, true, 8);
 	sm_config_set_out_pins(&sm_config, mosi->pin, 1);
-	sm_config_set_out_shift(&sm_config, false, true, bits);
+	sm_config_set_out_shift(&sm_config, false, true, 8);
 	sm_config_set_sideset_pins(&sm_config, clk->pin);
 	sm_config_set_sideset(&sm_config, 1, false, false);
 	sm_config_set_wrap(&sm_config, offset + wrap_target, offset + wrap);
@@ -205,10 +224,11 @@ static int spi_pico_pio_configure(const struct ads1x4s0x_pio_config *dev_cfg,
 	pio_gpio_init(data->pio, mosi->pin);
 	pio_gpio_init(data->pio, miso->pin);
 	pio_gpio_init(data->pio, clk->pin);
+	pio_gpio_init(data->pio, drdy->pin);
 
     gpio_pin_set_dt(&dev_cfg->gpio_cs, GPIO_OUTPUT_ACTIVE);
 
-	pio_sm_init(data->pio, data->pio_sm, offset, &sm_config);
+	pio_sm_init(data->pio, data->pio_sm, offset + entry_point, &sm_config);
 	pio_sm_set_enabled(data->pio, data->pio_sm, true);
 
     data->sm_configured = true;
@@ -221,10 +241,11 @@ static int spi_pico_pio_transceive(const struct device *dev,
 {
 	const struct ads1x4s0x_pio_config *dev_cfg = dev->config;
 	struct ads1x4s0x_pio_data *data = dev->data;
-	uint32_t txrx;
-	size_t fifo_cnt = 0;
-    size_t tx_count = 0;
-    size_t rx_count = 0;
+    uint8_t inst = 0;
+    uint8_t txrx;
+    bool half;
+    size_t tx_len = len;
+    size_t rx_len = len;
 	int rc = 0;
 
 	rc = spi_pico_pio_configure(dev_cfg, data);
@@ -234,33 +255,42 @@ static int spi_pico_pio_transceive(const struct device *dev,
 
 	pio_sm_clear_fifos(data->pio, data->pio_sm);
 
-	while (rx_count < len || tx_count < len) {
-		/* Fill up fifo with available TX data */
-		while ((!pio_sm_is_tx_fifo_full(data->pio, data->pio_sm)) &&
-		       tx_count < len && fifo_cnt < PIO_FIFO_DEPTH) {
-			/* Send 0 in the case of read only operation */
-			txrx = 0;
+    while (tx_len || rx_len) {
+        if (tx_len) {
+            if (txbuf) {
+                txrx = *txbuf;
+            }
 
-			if (txbuf) {
-				txrx = ((uint8_t *)txbuf)[tx_count];
-			}
-			spi_pico_pio_sm_put8(data->pio, data->pio_sm, txrx);
-			tx_count++;
-			fifo_cnt++;
-		}
+            for (int j = 8; j > 0; j--) {
+                while (pio_sm_is_tx_fifo_full(data->pio, data->pio_sm)) {
+                    ;
+                }
 
-		while ((!pio_sm_is_rx_fifo_empty(data->pio, data->pio_sm)) &&
-		       rx_count < len && fifo_cnt > 0) {
-			txrx = spi_pico_pio_sm_get8(data->pio, data->pio_sm);
+                inst |= (1 << 2) | ((txrx >> (j-1)) & 1);
 
-			/* Discard received data if rx buffer not assigned */
-			if (rxbuf) {
-				((uint8_t *)rxbuf)[rx_count] = (uint8_t)txrx;
-			}
-			rx_count++;
-			fifo_cnt--;
-		}
-	}
+                if (!half) {
+                    inst <<= 4;
+                    half = true;
+                } else {
+                    half = false;
+                    spi_pico_pio_sm_put8(data->pio, data->pio_sm, inst);
+                    inst = 0;
+                }
+            }
+            tx_len--;
+            txbuf++;
+        }
+
+        if (rx_len) {
+            if (!pio_sm_is_rx_fifo_empty(data->pio, data->pio_sm)) {
+                txrx = spi_pico_pio_sm_get8(data->pio, data->pio_sm);
+                if (rxbuf) {
+                    *rxbuf++ = txrx;
+                }
+                rx_len--;
+            }
+        }
+    }
 
     gpio_pin_set_dt(&dev_cfg->gpio_cs, GPIO_OUTPUT_INACTIVE);
 
@@ -1718,39 +1748,39 @@ static DEVICE_API(adc, api) = {
 BUILD_ASSERT(CONFIG_ADC_INIT_PRIORITY > CONFIG_SPI_INIT_PRIORITY,
 	     "CONFIG_ADC_INIT_PRIORITY must be higher than CONFIG_SPI_INIT_PRIORITY");
 
-#define ADC_ADS1X4S0X_INST_DEFINE(n, name, ch, res)                                               \
-	IF_ENABLED(                                                                               \
-		CONFIG_ADC_ASYNC,                                                                 \
-		(static K_KERNEL_STACK_DEFINE(                                                    \
-			 thread_stack_##name##_##n,                                               \
-			 CONFIG_ADC_ADS1X4S0X_ACQUISITION_THREAD_STACK_SIZE);)                    \
-	)                                                                                         \
-	PINCTRL_DT_INST_DEFINE(n);                                                             \
-	static const struct ads1x4s0x_pio_config config_##name##_##n = {                              \
-		IF_ENABLED(CONFIG_ADC_ASYNC, (.stack = thread_stack_##n,))                        \
-		.piodev = DEVICE_DT_GET(DT_INST_PARENT(n)), \
-		.pin_cfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n), \
-		.gpio_clk = GPIO_DT_SPEC_INST_GET(n, clk_gpios), \
-		.gpio_mosi = GPIO_DT_SPEC_INST_GET_OR(n, mosi_gpios, {0}), \
-		.gpio_miso = GPIO_DT_SPEC_INST_GET_OR(n, miso_gpios, {0}), \
-		.gpio_cs = GPIO_DT_SPEC_INST_GET_OR(n, cs_gpios, {0}), \
-		.clk_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(n)),                               \
-		.clk_id = (clock_control_subsys_t)DT_INST_PHA_BY_IDX(n, clocks, 0, clk_id),     \
-		.spi_freq = DT_INST_PROP_OR(n, spi_frequency, MHZ(1)), \
-		.gpio_reset = GPIO_DT_SPEC_INST_GET_OR(n, reset_gpios, {0}),                      \
-		.gpio_data_ready = GPIO_DT_SPEC_INST_GET(n, drdy_gpios),                          \
-		.gpio_start_sync = GPIO_DT_SPEC_INST_GET_OR(n, start_sync_gpios, {0}),            \
-		.idac_current = DT_INST_PROP(n, idac_current),                                    \
-		.vbias_level = DT_INST_PROP(n, vbias_level),                                      \
-		.vbias_level = DT_INST_PROP(n, vbias_level),                                      \
-		.resolution = res,                                                                \
-		.channels = ch,                                                                   \
-	};                                                                                        \
-	static struct ads1x4s0x_pio_data data_##name##_##n;                                           \
-	DEVICE_DT_INST_DEFINE(n, ads1x4s0x_pio_init, NULL, &data_##name##_##n, &config_##name##_##n,  \
-			      POST_KERNEL, CONFIG_ADC_INIT_PRIORITY, &api); \
-	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, clk_gpios)); \
-	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, mosi_gpios)); \
+#define ADC_ADS1X4S0X_INST_DEFINE(n, name, ch, res)                                              \
+	IF_ENABLED(                                                                                  \
+		CONFIG_ADC_ASYNC,                                                                        \
+		(static K_KERNEL_STACK_DEFINE(                                                           \
+			 thread_stack_##name##_##n,                                                          \
+			 CONFIG_ADC_ADS1X4S0X_ACQUISITION_THREAD_STACK_SIZE);)                               \
+	)                                                                                            \
+	PINCTRL_DT_INST_DEFINE(n);                                                                   \
+	static const struct ads1x4s0x_pio_config config_##name##_##n = {                             \
+		IF_ENABLED(CONFIG_ADC_ASYNC, (.stack = thread_stack_##n,))                               \
+		.piodev = DEVICE_DT_GET(DT_INST_PARENT(n)),                                              \
+		.pin_cfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n),                                            \
+		.gpio_clk = GPIO_DT_SPEC_INST_GET(n, clk_gpios),                                         \
+		.gpio_mosi = GPIO_DT_SPEC_INST_GET_OR(n, mosi_gpios, {0}),                               \
+		.gpio_miso = GPIO_DT_SPEC_INST_GET_OR(n, miso_gpios, {0}),                               \
+		.gpio_cs = GPIO_DT_SPEC_INST_GET_OR(n, cs_gpios, {0}),                                   \
+		.clk_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(n)),                                        \
+		.clk_id = (clock_control_subsys_t)DT_INST_PHA_BY_IDX(n, clocks, 0, clk_id),              \
+		.spi_freq = DT_INST_PROP_OR(n, spi_frequency, MHZ(1)),                                   \
+		.gpio_reset = GPIO_DT_SPEC_INST_GET_OR(n, reset_gpios, {0}),                             \
+		.gpio_data_ready = GPIO_DT_SPEC_INST_GET(n, drdy_gpios),                                 \
+		.gpio_start_sync = GPIO_DT_SPEC_INST_GET_OR(n, start_sync_gpios, {0}),                   \
+		.idac_current = DT_INST_PROP(n, idac_current),                                           \
+		.vbias_level = DT_INST_PROP(n, vbias_level),                                             \
+		.vbias_level = DT_INST_PROP(n, vbias_level),                                             \
+		.resolution = res,                                                                       \
+		.channels = ch,                                                                          \
+	};                                                                                           \
+	static struct ads1x4s0x_pio_data data_##name##_##n;                                          \
+	DEVICE_DT_INST_DEFINE(n, ads1x4s0x_pio_init, NULL, &data_##name##_##n, &config_##name##_##n, \
+			      POST_KERNEL, CONFIG_ADC_INIT_PRIORITY, &api);                                  \
+	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, clk_gpios));                                           \
+	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, mosi_gpios));                                          \
 	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, miso_gpios));
 
 /*
