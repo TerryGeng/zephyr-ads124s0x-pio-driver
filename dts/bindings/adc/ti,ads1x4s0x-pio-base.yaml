@@ -77,6 +77,18 @@ properties:
     description: |
       SPI clock frequency the SPI peripheral is being driven at, in Hz.
 
+      #dmas:
+      #  type: phandle-array
+      #  required: true
+      #  description: |
+      #    DMA channel indices, 5 in total is needed.
+
+      #dma-names:
+      #  type: string-array
+      #  required: true
+      #  description: |
+      #    Name for each DMA channel specified in `dmas`. Has to be `txc1`, `txc2`, `tx`, `rx1`, `rx2`.
+
   clocks:
     required: true
 

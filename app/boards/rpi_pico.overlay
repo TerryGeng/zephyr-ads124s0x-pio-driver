@@ -4,6 +4,8 @@
  * Copyright (c) 2022 TOKITA Hiroshi <tokita.hiroshi@fujitsu.com>
  */
 
+ #include <zephyr/dt-bindings/dma/rpi-pico-dma-rp2040.h>
+
 / {
 	zephyr,user {
 		// io-channels = <&adc 0>, <&adc_ads124s06_pio 0>;
@@ -37,20 +39,22 @@
 	};
 };
 
+&dma {
+    status = "okay";
+};
+
 &pio0 {
 	status = "okay";
 
-    #io-channel-cells = <1>;
-    #address-cells = <1>;
-    #size-cells = <0>;
-
-	adc_ads124s06_pio: ads124s06_pio@0 {
+	adc_ads124s06_pio: ads124s06_pio {
         pinctrl-0 = <&pio0_spi0_default>;
         pinctrl-names = "default";
 
 		compatible = "ti,ads124s06-pio";
 		status = "okay";
-        reg = <0>;
+
+        dmas = <&dma 0 0 0>, <&dma 1 0 0>, <&dma 2 0 0>, <&dma 3 0 0>, <&dma 4 0 0>;
+        dma-names = "txc1", "txc2", "tx", "rx1", "rx2";
 
 		miso-gpios = <&gpio0 4 0>;
 		cs-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;

@@ -7,6 +7,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/adc/ads1x4s0x_pio.h>
+#include <zephyr/drivers/dma.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/pinctrl.h>
@@ -19,8 +20,9 @@
 
 #include <zephyr/drivers/misc/pio_rpi_pico/pio_rpi_pico.h>
 
-#include <hardware/pio.h>
+#include "hardware/pio.h"
 #include "hardware/clocks.h"
+#include "hardware/dma.h"
 
 #define ADS1X4S0X_HAS_16_BIT_DEV                                                                   \
 	(DT_HAS_COMPAT_STATUS_OKAY(ti_ads114s06_pio) || DT_HAS_COMPAT_STATUS_OKAY(ti_ads114s08_pio))
@@ -34,12 +36,42 @@
 
 LOG_MODULE_REGISTER(ads1x4s0x_pio, CONFIG_ADC_LOG_LEVEL);
 
+struct pio_spi_odm_raw_program {
+    uint8_t *raw_inst;
+    size_t raw_inst_max_len;
+    size_t tx_cnt;
+    size_t rx_cnt;
+    size_t iptr;
+    bool half;
+};
+
+struct pio_spi_odm_dma_chan_config {
+    uint8_t tx;
+    uint8_t rx1;
+    uint8_t rx2;
+    uint8_t tx_ctrl1;
+    uint8_t tx_ctrl2;
+};
+
+#define SPI_ODM_INST_BUF_LEN 200
+
+struct ads1x4s0x_pio_bulk_read_data {
+    uint8_t sm_insts[SPI_ODM_INST_BUF_LEN];
+    struct pio_spi_odm_raw_program sm_raw_pgm;
+    struct ads1x4s0x_pio_bulk_read_config *current_pio_cfg;
+    struct k_sem bulk_data_ready_sem;
+    uint8_t data_ready_buf_ind;
+    size_t rx_buf_len;
+};
+
 struct ads1x4s0x_pio_config {
 #if CONFIG_ADC_ASYNC
 	k_thread_stack_t *stack;
 #endif
 	const struct device *piodev;
+    const struct device *dma_dev;
 	const struct pinctrl_dev_config *pin_cfg;
+    const struct pio_spi_odm_dma_chan_config dma_chan_cfg;
 	struct gpio_dt_spec gpio_clk;
 	struct gpio_dt_spec gpio_mosi;
 	struct gpio_dt_spec gpio_miso;
@@ -64,6 +96,8 @@ struct ads1x4s0x_pio_data {
 	PIO pio;
 	size_t pio_sm;
     bool sm_configured;
+    bool bulk_read_sm_running;
+
 	struct gpio_callback callback_data_ready;
 	struct k_sem data_ready_signal;
 	struct k_sem acquire_signal;
@@ -75,6 +109,7 @@ struct ads1x4s0x_pio_data {
 	uint8_t gpio_direction; /* one bit per GPIO, 1 = input */
 	uint8_t gpio_value;     /* one bit per GPIO, 1 = high */
 #endif                          /* CONFIG_ADC_ADS1X4S0X_GPIO */
+    struct ads1x4s0x_pio_bulk_read_data bulk_read_data;
 };
 
 /*############################################################*/
@@ -226,8 +261,6 @@ static int spi_pico_pio_configure(const struct ads1x4s0x_pio_config *dev_cfg,
 	pio_gpio_init(data->pio, clk->pin);
 	pio_gpio_init(data->pio, drdy->pin);
 
-    gpio_pin_set_dt(&dev_cfg->gpio_cs, GPIO_OUTPUT_ACTIVE);
-
 	pio_sm_init(data->pio, data->pio_sm, offset + entry_point, &sm_config);
 	pio_sm_set_enabled(data->pio, data->pio_sm, true);
 
@@ -243,7 +276,7 @@ static int spi_pico_pio_transceive(const struct device *dev,
 	struct ads1x4s0x_pio_data *data = dev->data;
     uint8_t inst = 0;
     uint8_t txrx;
-    bool half;
+    bool half = false;
     size_t tx_len = len;
     size_t rx_len = len;
 	int rc = 0;
@@ -252,6 +285,8 @@ static int spi_pico_pio_transceive(const struct device *dev,
 	if (rc < 0) {
         return rc;
 	}
+
+    gpio_pin_set_dt(&dev_cfg->gpio_cs, GPIO_OUTPUT_ACTIVE);
 
 	pio_sm_clear_fifos(data->pio, data->pio_sm);
 
@@ -315,6 +350,71 @@ static int spi_pico_pio_init(const struct device *dev)
 	}
 
 	return 0;
+}
+
+/* ------------- */
+/* PIO bluk read */
+/* ------------- */
+
+static void pio_spi_odm_inst_inst(struct pio_spi_odm_raw_program *pgm,
+        uint8_t *sm_insts, size_t max_inst_len) {
+    memset(sm_insts, 0, max_inst_len);
+    pgm->raw_inst = sm_insts;
+    pgm->raw_inst_max_len = max_inst_len;
+    pgm->tx_cnt = 0;
+    pgm->rx_cnt = 0;
+    pgm->iptr = 0;
+    pgm->half = false;
+}
+
+static void pio_spi_odm_inst_do_tx_rx(struct pio_spi_odm_raw_program *pgm,
+        uint8_t tx_byte, bool do_rx) {
+    uint8_t raw_pio_inst = 0;
+
+    pgm->rx_cnt += do_rx;
+
+    for (int j = 8; j > 0; j--) {
+        raw_pio_inst = (1 << 2) | (((!do_rx) & 1) << 1) | ((tx_byte >> (j-1)) & 1);
+
+        if (!pgm->half) {
+            pgm->raw_inst[pgm->iptr] = raw_pio_inst << 4;
+            pgm->half = true;
+
+        } else {
+            pgm->raw_inst[pgm->iptr] |= raw_pio_inst;
+            pgm->half = false;
+
+            ++pgm->iptr;
+        }
+    }
+}
+
+static void pio_spi_odm_inst_do_tx(struct pio_spi_odm_raw_program *pgm, uint8_t tx_byte) {
+    pio_spi_odm_inst_do_tx_rx(pgm, tx_byte, false);
+}
+
+static void pio_spi_odm_inst_do_wait(struct pio_spi_odm_raw_program *pgm) {
+    uint8_t raw_pio_inst = 0;
+
+    if (!pgm->half) {
+        pgm->raw_inst[pgm->iptr] = raw_pio_inst << 4;
+        pgm->half = true;
+
+    } else {
+        pgm->raw_inst[pgm->iptr] |= raw_pio_inst;
+        pgm->half = false;
+
+        ++pgm->iptr;
+    }
+}
+
+static void pio_spi_odm_inst_finalize(struct pio_spi_odm_raw_program *pgm) {
+    if (pgm->half) {
+        pgm->tx_cnt = pgm->iptr + 1;
+        pgm->raw_inst[pgm->iptr] |= (1 << 3);  /* write nop bit */
+    } else {
+        pgm->tx_cnt = pgm->iptr;
+    }
 }
 
 /*############################################################*/
@@ -823,8 +923,10 @@ static int ads1x4s0x_pio_send_command(const struct device *dev, enum ads1x4s0x_p
 	return 0;
 }
 
-static int ads1x4s0x_pio_channel_setup(const struct device *dev,
-				   const struct adc_channel_cfg *channel_cfg)
+static int ads1x4s0x_pio_make_channel_setup(const struct device *dev,
+				   const struct adc_channel_cfg *channel_cfg,
+                   enum ads1x4s0x_pio_register *register_addresses,  // length is 7
+                   uint8_t *values)   // length is 7
 {
 	const struct ads1x4s0x_pio_config *config = dev->config;
 	uint8_t input_mux = 0;
@@ -836,9 +938,6 @@ static int ads1x4s0x_pio_channel_setup(const struct device *dev,
 	uint8_t pin_selections[4];
 	uint8_t vbias = 0;
 	size_t pin_selections_size;
-	int result;
-	enum ads1x4s0x_pio_register register_addresses[7];
-	uint8_t values[ARRAY_SIZE(register_addresses)];
 	uint16_t acquisition_time_value = ADC_ACQ_TIME_VALUE(channel_cfg->acquisition_time);
 	uint16_t acquisition_time_unit = ADC_ACQ_TIME_UNIT(channel_cfg->acquisition_time);
 
@@ -848,11 +947,6 @@ static int ads1x4s0x_pio_channel_setup(const struct device *dev,
 	ADS1X4S0X_REGISTER_PGA_SET_DEFAULTS(gain);
 	ADS1X4S0X_REGISTER_IDACMAG_SET_DEFAULTS(idac_magnitude);
 	ADS1X4S0X_REGISTER_IDACMUX_SET_DEFAULTS(idac_mux);
-
-	if (channel_cfg->channel_id != 0) {
-		LOG_ERR("%s: only one channel is supported", dev->name);
-		return -EINVAL;
-	}
 
 	/* The ADS114 uses samples per seconds units with the lowest being 2.5SPS
 	 * and with acquisition_time only having 14b for time, this will not fit
@@ -1079,7 +1173,6 @@ static int ads1x4s0x_pio_channel_setup(const struct device *dev,
 	register_addresses[4] = ADS1X4S0X_REGISTER_IDACMAG;
 	register_addresses[5] = ADS1X4S0X_REGISTER_IDACMUX;
 	register_addresses[6] = ADS1X4S0X_REGISTER_VBIAS;
-	BUILD_ASSERT(ARRAY_SIZE(register_addresses) == 7);
 	values[0] = input_mux;
 	values[1] = gain;
 	values[2] = data_rate;
@@ -1087,7 +1180,27 @@ static int ads1x4s0x_pio_channel_setup(const struct device *dev,
 	values[4] = idac_magnitude;
 	values[5] = idac_mux;
 	values[6] = vbias;
-	BUILD_ASSERT(ARRAY_SIZE(values) == 7);
+
+    return 0;
+}
+
+static int ads1x4s0x_pio_channel_setup(const struct device *dev,
+				   const struct adc_channel_cfg *channel_cfg)
+{
+	int result;
+	enum ads1x4s0x_pio_register register_addresses[7];
+	uint8_t values[ARRAY_SIZE(register_addresses)];
+
+	if (channel_cfg->channel_id != 0) {
+		LOG_ERR("%s: only one channel is supported", dev->name);
+		return -EINVAL;
+	}
+
+    result = ads1x4s0x_pio_make_channel_setup(dev, channel_cfg, register_addresses, values);
+
+	if (result != 0) {
+        return result;
+    }
 
 	result = ads1x4s0x_pio_write_multiple_registers(dev, register_addresses, values,
 						    ARRAY_SIZE(values));
@@ -1382,6 +1495,349 @@ static void ads1x4s0x_pio_acquisition_thread(void *p1, void *p2, void *p3)
 	}
 }
 #endif
+
+static int ads1x4s0x_pio_append_write_multiple_registers_insts(
+        struct pio_spi_odm_raw_program *sm_raw_pgm,
+        enum ads1x4s0x_pio_register *register_addresses,
+        uint8_t *values, size_t count)
+{
+	uint8_t buffer_tx[32];
+
+	if (count == 0) {
+		LOG_WRN("ignoring the command to write 0 registers");
+		return -EINVAL;
+	}
+
+	buffer_tx[0] = ((uint8_t)ADS1X4S0X_COMMAND_WREG) | ((uint8_t)register_addresses[0]);
+	buffer_tx[1] = count - 1;
+
+    memcpy(buffer_tx + 2, values, count);
+
+	/* ensure that the register addresses are in the correct order */
+	for (size_t i = 1; i < count; ++i) {
+		__ASSERT(register_addresses[i - 1] + 1 == register_addresses[i],
+			 "register addresses are not consecutive");
+	}
+
+	for (size_t i = 0; i < count + 2; ++i) {
+        pio_spi_odm_inst_do_tx(sm_raw_pgm, buffer_tx[i]);
+    }
+
+	return 0;
+}
+
+static int ads1x4s0x_pio_prepare_bulk_read_sm_insts(
+        const struct device *dev,
+        struct pio_spi_odm_raw_program *sm_raw_pgm,
+        struct ads1x4s0x_pio_bulk_read_config *pio_cfg)
+{
+    int result;
+	enum ads1x4s0x_pio_register register_addresses[7];
+	uint8_t values[ARRAY_SIZE(register_addresses)];
+	uint8_t prev_values[ARRAY_SIZE(register_addresses)];
+    uint8_t multi_write_start_ind;
+    uint8_t multi_write_cnt;
+
+    result = ads1x4s0x_pio_make_channel_setup(dev,
+            &pio_cfg->chan_cfgs[pio_cfg->chan_count-1], register_addresses, prev_values);
+
+    if (result != 0) {
+        return result;
+    }
+
+    for (int i = 0; i < pio_cfg->chan_count; ++i) {
+        multi_write_cnt = 0;
+
+        result = ads1x4s0x_pio_make_channel_setup(dev,
+                &pio_cfg->chan_cfgs[i], register_addresses, values);
+
+        if (result != 0) {
+            return result;
+        }
+
+
+        for (int j = 0; j < ARRAY_SIZE(register_addresses); ++j) {
+            if (values[j] == prev_values[j]) {
+                if (multi_write_cnt == 0) {
+                    continue;
+                }
+
+                ads1x4s0x_pio_append_write_multiple_registers_insts(sm_raw_pgm,
+                        register_addresses + multi_write_start_ind,
+                        values + multi_write_start_ind,
+                        multi_write_cnt);
+                multi_write_cnt = 0;
+            } else {
+                if (multi_write_cnt == 0) {
+                    multi_write_start_ind = j;
+                }
+                multi_write_cnt++;
+            }
+        }
+
+        if (multi_write_cnt) {
+            ads1x4s0x_pio_append_write_multiple_registers_insts(sm_raw_pgm,
+                    register_addresses + multi_write_start_ind,
+                    values + multi_write_start_ind,
+                    multi_write_cnt);
+        }
+
+        for (int r = 0; r < pio_cfg->sample_count; ++r) {
+            pio_spi_odm_inst_do_tx(sm_raw_pgm, ADS1X4S0X_COMMAND_START);
+            pio_spi_odm_inst_do_wait(sm_raw_pgm);
+
+            /*pio_spi_odm_inst_do_tx_rx(pgm, ADS1X4S0X_COMMAND_RDATA, false);*/
+            pio_spi_odm_inst_do_tx_rx(sm_raw_pgm, 0x00, true);
+            pio_spi_odm_inst_do_tx_rx(sm_raw_pgm, 0x00, true);
+            pio_spi_odm_inst_do_tx_rx(sm_raw_pgm, 0x00, true);
+            pio_spi_odm_inst_do_tx_rx(sm_raw_pgm, 0x00, true);
+        }
+
+        memcpy(prev_values, values, ARRAY_SIZE(register_addresses));
+    }
+
+    pio_spi_odm_inst_finalize(sm_raw_pgm);
+
+    return 0;
+}
+
+static void ads1x4s0x_pio_bulk_read_callback(const struct device *dma_dev, void *arg, uint32_t channel,
+				   int status)
+{
+	const struct device *dev = (const struct device *)arg;
+    const struct ads1x4s0x_pio_config *config = dev->config;
+	struct ads1x4s0x_pio_data *data = dev->data;
+	struct ads1x4s0x_pio_bulk_read_data *bdata = &data->bulk_read_data;
+
+    if (channel == config->dma_chan_cfg.rx1) {
+        bdata->data_ready_buf_ind = 1;
+        dma_hw->ch[config->dma_chan_cfg.rx1].write_addr = (uint32_t)bdata->current_pio_cfg->sample_buf_1;
+        dma_irqn_set_channel_enabled(config->dma_chan_cfg.rx1 % 2, config->dma_chan_cfg.rx1, true);
+    } else if (channel == config->dma_chan_cfg.rx2) {
+        bdata->data_ready_buf_ind = 2;
+        dma_hw->ch[config->dma_chan_cfg.rx2].write_addr = (uint32_t)bdata->current_pio_cfg->sample_buf_2;
+        dma_irqn_set_channel_enabled(config->dma_chan_cfg.rx2 % 2, config->dma_chan_cfg.rx2, true);
+    } else {
+        __ASSERT(false, "Unknown DMA channel");
+    }
+
+    k_sem_give(&bdata->bulk_data_ready_sem);
+}
+
+size_t ads1x4s0x_pio_bulk_read_get_samples_blocking(
+        const struct device *dev, uint8_t *buf_ind) {
+    int ret;
+	struct ads1x4s0x_pio_data *data = dev->data;
+	struct ads1x4s0x_pio_bulk_read_data *bdata = &data->bulk_read_data;
+
+    ret = k_sem_take(&bdata->bulk_data_ready_sem, K_FOREVER);
+
+    if (ret != 0) {
+        return 0;
+    }
+
+    *buf_ind = bdata->data_ready_buf_ind;
+
+    return bdata->rx_buf_len;
+}
+
+int ads1x4s0x_pio_bulk_read_setup(const struct device *dev,
+        struct ads1x4s0x_pio_bulk_read_config *pio_cfg)
+{
+    const struct ads1x4s0x_pio_config *config = dev->config;
+	struct ads1x4s0x_pio_data *data = dev->data;
+    struct ads1x4s0x_pio_bulk_read_data *bdata = &data->bulk_read_data;
+    int result;
+    dma_channel_config txcc1;
+    dma_channel_config txcc2;
+    dma_channel_config txc;
+    dma_channel_config rxc1;
+    dma_channel_config rxc2;
+    struct dma_config zephyr_rxc;  /* just for getting irq */
+    struct dma_block_config zephyr_rxc_block_cfg;
+
+	result = spi_pico_pio_configure(config, data);
+	if (result < 0) {
+        return result;
+	}
+
+	pio_sm_clear_fifos(data->pio, data->pio_sm);
+
+    bdata->rx_buf_len = pio_cfg->sample_count * pio_cfg->repeat_count * pio_cfg->chan_count * 4;
+
+    struct pio_spi_odm_raw_program *pgm = &bdata->sm_raw_pgm;
+
+    bdata->current_pio_cfg = pio_cfg;
+
+    memset(&zephyr_rxc, 0, sizeof(struct dma_config));
+    memset(&zephyr_rxc_block_cfg, 0, sizeof(struct dma_block_config));
+
+    pio_spi_odm_inst_inst(pgm, bdata->sm_insts, SPI_ODM_INST_BUF_LEN);
+
+    result = ads1x4s0x_pio_prepare_bulk_read_sm_insts(dev, pgm, pio_cfg);
+
+    txcc1 = dma_channel_get_default_config(config->dma_chan_cfg.tx_ctrl1);
+    txcc2 = dma_channel_get_default_config(config->dma_chan_cfg.tx_ctrl2);
+    txc = dma_channel_get_default_config(config->dma_chan_cfg.tx);
+    rxc1 = dma_channel_get_default_config(config->dma_chan_cfg.rx1);
+    rxc2 = dma_channel_get_default_config(config->dma_chan_cfg.rx2);
+
+    /* Config tx */
+
+    channel_config_set_transfer_data_size(&txcc1, DMA_SIZE_32);
+    channel_config_set_read_increment(&txcc1, false);
+    channel_config_set_write_increment(&txcc1, false);
+    channel_config_set_chain_to(&txcc1, config->dma_chan_cfg.tx_ctrl2);
+
+    dma_channel_configure(
+        config->dma_chan_cfg.tx_ctrl1,
+        &txcc1,
+        &dma_hw->ch[config->dma_chan_cfg.tx].al3_transfer_count,
+        &pgm->tx_cnt,
+        1,
+        false
+    );
+
+    channel_config_set_transfer_data_size(&txcc2, DMA_SIZE_32);
+    channel_config_set_read_increment(&txcc2, false);
+    channel_config_set_write_increment(&txcc2, false);
+
+    dma_channel_configure(
+        config->dma_chan_cfg.tx_ctrl2,
+        &txcc2,
+        &dma_hw->ch[config->dma_chan_cfg.tx].al3_read_addr_trig,
+        &pgm->raw_inst,
+        1,
+        false
+    );
+
+    channel_config_set_read_increment(&txc, true);
+    channel_config_set_write_increment(&txc, false);
+    channel_config_set_dreq(&txc, pio_get_dreq(data->pio, data->pio_sm, true));
+    channel_config_set_transfer_data_size(&txc, DMA_SIZE_8);
+    channel_config_set_chain_to(&txc, config->dma_chan_cfg.tx_ctrl1);
+
+    dma_channel_configure(config->dma_chan_cfg.tx, &txc, &data->pio->txf[data->pio_sm], NULL, 0, false);
+
+    /* Config rx */
+
+    zephyr_rxc.source_burst_length = 1;
+    zephyr_rxc.dest_burst_length = 1;
+    zephyr_rxc.user_data = (void *)dev;
+    zephyr_rxc.block_count = 1U;
+    zephyr_rxc.head_block = &zephyr_rxc_block_cfg;
+    zephyr_rxc.dma_slot = 0x3b; /* Placeholder. Shall be overridden by actual DREQ */
+    zephyr_rxc.channel_direction = PERIPHERAL_TO_MEMORY;
+    zephyr_rxc.source_data_size = 1;
+    zephyr_rxc.dest_data_size = 1;
+    zephyr_rxc.dma_callback = ads1x4s0x_pio_bulk_read_callback;
+    zephyr_rxc_block_cfg.block_size = bdata->rx_buf_len;
+    zephyr_rxc_block_cfg.source_address = (uint32_t)&data->pio->rxf[data->pio_sm];
+    zephyr_rxc_block_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+
+    /* just for setting up irq */
+    result = dma_config(config->dma_dev, config->dma_chan_cfg.rx1, &zephyr_rxc);
+    if (result != 0) {
+        return result;
+    }
+
+    result = dma_config(config->dma_dev, config->dma_chan_cfg.rx2, &zephyr_rxc);
+    if (result != 0) {
+        return result;
+    }
+
+    channel_config_set_read_increment(&rxc1, false);
+    channel_config_set_write_increment(&rxc1, true);
+    channel_config_set_dreq(&rxc1, pio_get_dreq(data->pio, data->pio_sm, false));
+    channel_config_set_transfer_data_size(&rxc1, DMA_SIZE_8);
+    channel_config_set_chain_to(&rxc1, config->dma_chan_cfg.rx2);
+
+    dma_channel_configure(config->dma_chan_cfg.rx1,
+            &rxc1, pio_cfg->sample_buf_1, &data->pio->rxf[data->pio_sm], bdata->rx_buf_len, false);
+
+    channel_config_set_read_increment(&rxc2, false);
+    channel_config_set_write_increment(&rxc2, true);
+    channel_config_set_dreq(&rxc2, pio_get_dreq(data->pio, data->pio_sm, false));
+    channel_config_set_transfer_data_size(&rxc2, DMA_SIZE_8);
+    channel_config_set_chain_to(&rxc2, config->dma_chan_cfg.rx1);
+
+    dma_channel_configure(config->dma_chan_cfg.rx2,
+            &rxc2, pio_cfg->sample_buf_2, &data->pio->rxf[data->pio_sm], bdata->rx_buf_len, false);
+
+    dma_irqn_set_channel_enabled(config->dma_chan_cfg.rx1 % 2, config->dma_chan_cfg.rx1, true);
+    dma_irqn_set_channel_enabled(config->dma_chan_cfg.rx2 % 2, config->dma_chan_cfg.rx2, true);
+
+    return 0;
+}
+
+int ads1x4s0x_pio_bulk_read_start(const struct device *dev)
+{
+    const struct ads1x4s0x_pio_config *config = dev->config;
+	struct ads1x4s0x_pio_data *data = dev->data;
+    struct ads1x4s0x_pio_bulk_read_data *bdata = &data->bulk_read_data;
+	enum ads1x4s0x_pio_register register_addresses[7];
+	uint8_t values[ARRAY_SIZE(register_addresses)];
+    int result;
+
+    if (bdata->current_pio_cfg == NULL) {
+		LOG_ERR("%s: bulk read hasn't been configured", dev->name);
+		return -EINVAL;
+    }
+
+    if (data->bulk_read_sm_running) {
+		LOG_ERR("%s: bulk read is running", dev->name);
+		return -EINVAL;
+    }
+    gpio_pin_set_dt(&config->gpio_cs, GPIO_OUTPUT_ACTIVE);
+
+    result = ads1x4s0x_pio_make_channel_setup(dev, &bdata->current_pio_cfg->chan_cfgs[0],
+            register_addresses, values);
+
+    if (result != 0) {
+        return result;
+    }
+
+	result = ads1x4s0x_pio_write_multiple_registers(dev, register_addresses, values,
+						    ARRAY_SIZE(values));
+
+	if (result != 0) {
+		LOG_ERR("%s: unable to configure registers", dev->name);
+		return result;
+	}
+
+    data->bulk_read_sm_running = true;
+
+    dma_start_channel_mask((1u << config->dma_chan_cfg.rx1) | (1u << config->dma_chan_cfg.tx_ctrl1));
+
+    return 0;
+}
+
+int ads1x4s0x_pio_bulk_read_stop(const struct device *dev)
+{
+    const struct ads1x4s0x_pio_config *config = dev->config;
+	struct ads1x4s0x_pio_data *data = dev->data;
+
+    if (!data->bulk_read_sm_running) {
+		LOG_ERR("%s: bulk read is not running", dev->name);
+		return -EINVAL;
+    }
+
+    hw_clear_bits(&dma_hw->ch[config->dma_chan_cfg.tx_ctrl1].ctrl_trig, DMA_CH0_CTRL_TRIG_EN_BITS);
+
+    while (dma_hw->ch[config->dma_chan_cfg.tx].ctrl_trig & DMA_CH0_CTRL_TRIG_BUSY_BITS) {
+        k_sleep(K_MSEC(1));
+    }
+
+    hw_clear_bits(&dma_hw->ch[config->dma_chan_cfg.rx1].ctrl_trig, DMA_CH0_CTRL_TRIG_EN_BITS);
+    hw_clear_bits(&dma_hw->ch[config->dma_chan_cfg.rx2].ctrl_trig, DMA_CH0_CTRL_TRIG_EN_BITS);
+    hw_set_bits(&dma_hw->abort, (1u << config->dma_chan_cfg.rx1) | (1u << config->dma_chan_cfg.rx2));
+
+    gpio_pin_set_dt(&config->gpio_cs, GPIO_OUTPUT_INACTIVE);
+
+    data->bulk_read_sm_running = false;
+
+    return 0;
+}
 
 #ifdef CONFIG_ADC_ADS1X4S0X_PIO_GPIO
 static int ads1x4s0x_pio_gpio_write_config(const struct device *dev)
@@ -1732,6 +2188,8 @@ static int ads1x4s0x_pio_init(const struct device *dev)
 	}
 #endif
 
+	k_sem_init(&data->bulk_read_data.bulk_data_ready_sem, 0, 1);
+
 	adc_context_unlock_unconditionally(&data->ctx);
 
 	return result;
@@ -1775,8 +2233,16 @@ BUILD_ASSERT(CONFIG_ADC_INIT_PRIORITY > CONFIG_SPI_INIT_PRIORITY,
 		.vbias_level = DT_INST_PROP(n, vbias_level),                                             \
 		.resolution = res,                                                                       \
 		.channels = ch,                                                                          \
+        .dma_dev = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(n, tx)), \
+        .dma_chan_cfg = { \
+            .tx = DT_INST_DMAS_CELL_BY_NAME(n, tx, channel), \
+            .tx_ctrl1 = DT_INST_DMAS_CELL_BY_NAME(n, txc1, channel), \
+            .tx_ctrl2 = DT_INST_DMAS_CELL_BY_NAME(n, txc2, channel), \
+            .rx1 = DT_INST_DMAS_CELL_BY_NAME(n, rx1, channel), \
+            .rx2 = DT_INST_DMAS_CELL_BY_NAME(n, rx2, channel), \
+        } \
 	};                                                                                           \
-	static struct ads1x4s0x_pio_data data_##name##_##n;                                          \
+    static struct ads1x4s0x_pio_data data_##name##_##n; \
 	DEVICE_DT_INST_DEFINE(n, ads1x4s0x_pio_init, NULL, &data_##name##_##n, &config_##name##_##n, \
 			      POST_KERNEL, CONFIG_ADC_INIT_PRIORITY, &api);                                  \
 	BUILD_ASSERT(DT_INST_NODE_HAS_PROP(n, clk_gpios));                                           \
