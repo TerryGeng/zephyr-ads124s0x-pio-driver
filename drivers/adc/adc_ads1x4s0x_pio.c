@@ -1832,6 +1832,12 @@ int ads1x4s0x_pio_bulk_read_stop(const struct device *dev)
     hw_clear_bits(&dma_hw->ch[config->dma_chan_cfg.rx2].ctrl_trig, DMA_CH0_CTRL_TRIG_EN_BITS);
     hw_set_bits(&dma_hw->abort, (1u << config->dma_chan_cfg.rx1) | (1u << config->dma_chan_cfg.rx2));
 
+    while (dma_hw->ch[config->dma_chan_cfg.rx1].ctrl_trig & DMA_CH0_CTRL_TRIG_BUSY_BITS ||
+            dma_hw->ch[config->dma_chan_cfg.rx2].ctrl_trig & DMA_CH0_CTRL_TRIG_BUSY_BITS
+            ) {
+        k_sleep(K_MSEC(1));
+    }
+
     gpio_pin_set_dt(&config->gpio_cs, GPIO_OUTPUT_INACTIVE);
 
     data->bulk_read_sm_running = false;
