@@ -1,7 +1,3 @@
-# Copyright (c) 2023 SILA  Embedded Solutions GmbH
-#
-# SPDX-License-Identifier: Apache-2.0
-
 menuconfig ADC_ADS1X4S0X_PIO
 	bool "Texas instruments ADS1X4S0X on PIO"
 	default y
@@ -26,6 +22,17 @@ config ADC_ADS1X4S0X_PIO_ACQUISITION_THREAD_STACK_SIZE
 	help
 	  Size of the stack used for the internal data acquisition
 	  thread.
+
+config ADC_ADS1X4S0X_PIO_SM_INST_BUF_SIZE
+	int "Size of instruction buffer size of the state machine"
+	default 200
+	depends on ADC_ADS1X4S0X_PIO
+	help
+	  Size of instruction buffer size of the state machine.
+	  The worst case is 52.5 bytes per channel if each of them has
+	  completely different configuration.
+	  If multiplexing setting is the only difference between channels,
+	  the number is 32.5 bytes per channel.
 
 config ADC_ADS1X4S0X_PIO_GPIO
 	bool "GPIO support"

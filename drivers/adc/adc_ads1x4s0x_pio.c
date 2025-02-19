@@ -48,10 +48,8 @@ struct pio_spi_odm_dma_chan_config {
     uint8_t tx_ctrl2;
 };
 
-#define SPI_ODM_INST_BUF_LEN 200
-
 struct ads1x4s0x_pio_bulk_read_data {
-    uint8_t sm_insts[SPI_ODM_INST_BUF_LEN];
+    uint8_t sm_insts[CONFIG_ADC_ADS1X4S0X_PIO_SM_INST_BUF_SIZE];
     struct pio_spi_odm_raw_program sm_raw_pgm;
     struct ads1x4s0x_pio_bulk_read_config *current_pio_cfg;
     struct k_sem bulk_data_ready_sem;
@@ -1720,7 +1718,7 @@ int ads1x4s0x_pio_bulk_read_setup(const struct device *dev,
     memset(&zephyr_rxc, 0, sizeof(struct dma_config));
     memset(&zephyr_rxc_block_cfg, 0, sizeof(struct dma_block_config));
 
-    pio_spi_odm_inst_inst(pgm, bdata->sm_insts, SPI_ODM_INST_BUF_LEN);
+    pio_spi_odm_inst_inst(pgm, bdata->sm_insts, CONFIG_ADC_ADS1X4S0X_PIO_SM_INST_BUF_SIZE);
 
     result = ads1x4s0x_pio_prepare_bulk_read_sm_insts(dev, pgm, pio_cfg);
 
