@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2023 SILA Embedded Solutions GmbH
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
 #ifndef ZEPHYR_INCLUDE_DRIVERS_ADC_ADS1X4S0X_PIO_H_
 #define ZEPHYR_INCLUDE_DRIVERS_ADC_ADS1X4S0X_PIO_H_
 

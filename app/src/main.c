@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2020 Libre Solar Technologies GmbH
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -67,6 +61,7 @@ struct ads1x4s0x_pio_bulk_read_config br_cfg = {
 
 static void print_buffer(const struct interleaving_channel_buf *buf, size_t len, bool verbose) {
     int32_t sample;
+    uint8_t crc;
     float my_fval_mv;
 
     for (size_t j = 0; j < len; ++j) {
@@ -75,11 +70,13 @@ static void print_buffer(const struct interleaving_channel_buf *buf, size_t len,
         }
 
         for (int i = 0; i < ARRAY_SIZE(adc_channels); ++i) {
+            crc = (buf[j].channel_sample[i] >> ADS1X4S0X_RESOLUTION) & 0xFF;
             sample = (int32_t)sys_get_be32((uint8_t *)&(buf[j].channel_sample[i])) >> (32 - ADS1X4S0X_RESOLUTION);
 
             if (verbose) {
                 my_fval_mv = 2500.0f * sample / (1 << 23);
-                LOG_INF("[%2d] %d: Read 0x%06x = %d = %.3f mV", j, i, sample, sample, my_fval_mv);
+                LOG_INF("[%2d] %d: Read Raw 0x%08x (crc %02x) = 0x%06x = %d = %.3f mV",
+                        j, i, buf[j].channel_sample[i], crc, sample, sample, my_fval_mv);
             } else {
                 LOG_INF("%d", sample);
             }

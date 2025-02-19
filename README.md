@@ -45,9 +45,9 @@ user's request.
 Please change the device tree bindings in `app/boards/rpi_pico.overlay` if you
 have a different wiring or ADC channel settings.
 
-Interaction to this program is based on the UART on GPIO 0 and 1, though UART
+Users can interact with this program via the UART on GPIO 0 and 1 (though UART
 via USB console is easily available by compiling with the [cdc-acm-console
-snippet](https://docs.zephyrproject.org/latest/snippets/cdc-acm-console/README.html).
+snippet](https://docs.zephyrproject.org/latest/snippets/cdc-acm-console/README.html)).
 
 The shell subsystem is enabled and has been configured with two commands
  - `acq start`: Start acquisition, read channel 0 and 1, 2 and 3, 4 and 5,

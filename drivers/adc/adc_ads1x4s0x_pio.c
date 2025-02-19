@@ -1,8 +1,3 @@
-/*
- * Copyright (c) 2023 SILA Embedded Solutions GmbH
- *
- * SPDX-License-Identifier: Apache-2.0
- */
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
@@ -730,6 +725,46 @@ enum ads1x4s0x_pio_register {
 #define ADS1X4S0X_REGISTER_VBIAS_VB_LEVEL_SET(target, value)                                       \
     ADS1X4S0X_REGISTER_SET_VALUE(target, value, ADS1X4S0X_REGISTER_VBIAS_VB_LEVEL_POS,         \
             ADS1X4S0X_REGISTER_VBIAS_VB_LEVEL_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_SYS_MON_LENGTH 3
+#define ADS1X4S0X_REGISTER_SYS_SYS_MON_POS    5
+#define ADS1X4S0X_REGISTER_SYS_SYS_MON_GET(value)                                                  \
+    ADS1X4S0X_REGISTER_GET_VALUE(value, ADS1X4S0X_REGISTER_SYS_SYS_MON_POS,                    \
+            ADS1X4S0X_REGISTER_SYS_SYS_MON_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_SYS_MON_SET(target, value)                                          \
+    ADS1X4S0X_REGISTER_SET_VALUE(target, value, ADS1X4S0X_REGISTER_SYS_SYS_MON_POS,            \
+            ADS1X4S0X_REGISTER_SYS_SYS_MON_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_CAL_SAMP_LENGTH 2
+#define ADS1X4S0X_REGISTER_SYS_CAL_SAMP_POS    3
+#define ADS1X4S0X_REGISTER_SYS_CAL_SAMP_GET(value)                                                  \
+    ADS1X4S0X_REGISTER_GET_VALUE(value, ADS1X4S0X_REGISTER_SYS_CAL_SAMP_POS,                    \
+            ADS1X4S0X_REGISTER_SYS_CAL_SAMP_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_CAL_SAMP_SET(target, value)                                          \
+    ADS1X4S0X_REGISTER_SET_VALUE(target, value, ADS1X4S0X_REGISTER_SYS_CAL_SAMP_POS,            \
+            ADS1X4S0X_REGISTER_SYS_CAL_SAMP_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_TIMEOUT_LENGTH 1
+#define ADS1X4S0X_REGISTER_SYS_TIMEOUT_POS    2
+#define ADS1X4S0X_REGISTER_SYS_TIMEOUT_GET(value)                                                  \
+    ADS1X4S0X_REGISTER_GET_VALUE(value, ADS1X4S0X_REGISTER_SYS_TIMEOUT_POS,                    \
+            ADS1X4S0X_REGISTER_SYS_TIMEOUT_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_TIMEOUT_SET(target, value)                                          \
+    ADS1X4S0X_REGISTER_SET_VALUE(target, value, ADS1X4S0X_REGISTER_SYS_TIMEOUT_POS,            \
+            ADS1X4S0X_REGISTER_SYS_TIMEOUT_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_CRC_LENGTH 1
+#define ADS1X4S0X_REGISTER_SYS_CRC_POS    1
+#define ADS1X4S0X_REGISTER_SYS_CRC_GET(value)                                                  \
+    ADS1X4S0X_REGISTER_GET_VALUE(value, ADS1X4S0X_REGISTER_SYS_CRC_POS,                    \
+            ADS1X4S0X_REGISTER_SYS_CRC_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_CRC_SET(target, value)                                          \
+    ADS1X4S0X_REGISTER_SET_VALUE(target, value, ADS1X4S0X_REGISTER_SYS_CRC_POS,            \
+            ADS1X4S0X_REGISTER_SYS_CRC_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_SENDSTAT_LENGTH 1
+#define ADS1X4S0X_REGISTER_SYS_SENDSTAT_POS    0
+#define ADS1X4S0X_REGISTER_SYS_SENDSTAT_GET(value)                                                  \
+    ADS1X4S0X_REGISTER_GET_VALUE(value, ADS1X4S0X_REGISTER_SYS_SENDSTAT_POS,                    \
+            ADS1X4S0X_REGISTER_SYS_SENDSTAT_LENGTH)
+#define ADS1X4S0X_REGISTER_SYS_SENDSTAT_SET(target, value)                                          \
+    ADS1X4S0X_REGISTER_SET_VALUE(target, value, ADS1X4S0X_REGISTER_SYS_SENDSTAT_POS,            \
+            ADS1X4S0X_REGISTER_SYS_SENDSTAT_LENGTH)
 #define ADS1X4S0X_REGISTER_GPIODAT_DIR_LENGTH 4
 #define ADS1X4S0X_REGISTER_GPIODAT_DIR_POS    4
 #define ADS1X4S0X_REGISTER_GPIODAT_DIR_GET(value)                                                  \
@@ -754,6 +789,19 @@ enum ads1x4s0x_pio_register {
 #define ADS1X4S0X_REGISTER_GPIOCON_CON_SET(target, value)                                          \
     ADS1X4S0X_REGISTER_SET_VALUE(target, value, ADS1X4S0X_REGISTER_GPIOCON_CON_POS,            \
             ADS1X4S0X_REGISTER_GPIOCON_CON_LENGTH)
+ /*
+ * - Disable system monitor
+ * - Calibration sample size: 8 samples
+ * - Disable SPI timeout
+ * - **Enabled CRC**
+ * - Disable status byte
+ */
+#define ADS1X4S0X_REGISTER_SYS_SET_DEFAULTS(target)                                                 \
+    ADS1X4S0X_REGISTER_SYS_SYS_MON_SET(target, 0b000);                                          \
+    ADS1X4S0X_REGISTER_SYS_CAL_SAMP_SET(target, 0b10);                                              \
+    ADS1X4S0X_REGISTER_SYS_TIMEOUT_SET(target, 0b0);                                            \
+    ADS1X4S0X_REGISTER_SYS_CRC_SET(target, 0b1);                                                    \
+    ADS1X4S0X_REGISTER_SYS_SENDSTAT_SET(target, 0b0)
 
 /*
  * - AIN0 as positive input
@@ -2065,6 +2113,7 @@ static int ads1x4s0x_pio_init(const struct device *dev)
 {
     uint8_t status = 0;
     uint8_t reference_control = 0;
+    uint8_t sys_control = 0;
     uint8_t reference_control_read;
     int result;
     const struct ads1x4s0x_pio_config *config = dev->config;
@@ -2152,6 +2201,15 @@ static int ads1x4s0x_pio_init(const struct device *dev)
     if (ADS1X4S0X_REGISTER_STATUS_NOT_RDY_GET(status) == 0x01) {
         LOG_ERR("%s: ADS114 is not yet ready", dev->name);
         return -EBUSY;
+    }
+
+
+    ADS1X4S0X_REGISTER_SYS_SET_DEFAULTS(sys_control);
+
+    result = ads1x4s0x_pio_write_register(dev, ADS1X4S0X_REGISTER_SYS, sys_control);
+    if (result != 0) {
+        LOG_ERR("%s: unable to set default system control values", dev->name);
+        return result;
     }
 
     /*
