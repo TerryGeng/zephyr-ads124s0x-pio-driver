@@ -54,7 +54,7 @@ struct ads1x4s0x_pio_bulk_read_config br_cfg = {
     .chan_cfgs = channel_cfgs,
     .chan_count = ARRAY_SIZE(adc_channels),
     .sample_count = 1,
-    .repeat_count = 5,
+    .repeat_count = REPEAT_CNT,
     .sample_buf_1 = (uint8_t *)sample_buf1,
     .sample_buf_2 = (uint8_t *)sample_buf2,
 };
@@ -71,7 +71,7 @@ static void print_buffer(const struct interleaving_channel_buf *buf, size_t len,
 
         for (int i = 0; i < ARRAY_SIZE(adc_channels); ++i) {
             crc = (buf[j].channel_sample[i] >> ADS1X4S0X_RESOLUTION) & 0xFF;
-            sample = (int32_t)sys_get_be32((uint8_t *)&(buf[j].channel_sample[i])) >> (32 - ADS1X4S0X_RESOLUTION);
+            sample = ads1x4s0x_pio_sample_to_int(dev, buf[j].channel_sample[i]);
 
             if (verbose) {
                 my_fval_mv = 2500.0f * sample / (1 << 23);

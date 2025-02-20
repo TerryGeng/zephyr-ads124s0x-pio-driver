@@ -49,4 +49,6 @@ int ads1x4s0x_pio_bulk_read_stop(const struct device *dev);
 size_t ads1x4s0x_pio_bulk_read_get_samples_blocking(
         const struct device *dev, uint8_t *buf_ind);
 
+int32_t ads1x4s0x_pio_sample_to_int(const struct device *dev, const uint32_t samp);
+
 #endif /* ZEPHYR_INCLUDE_DRIVERS_ADC_ADS1X4S0X_PIO_H_ */

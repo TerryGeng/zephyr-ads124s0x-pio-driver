@@ -1891,6 +1891,12 @@ int ads1x4s0x_pio_bulk_read_stop(const struct device *dev)
     return 0;
 }
 
+int32_t ads1x4s0x_pio_sample_to_int(const struct device *dev, const uint32_t samp) {
+    const struct ads1x4s0x_pio_config *config = dev->config;
+
+    return (int32_t)sys_get_be32((uint8_t *)&samp) >> (32 - config->resolution);
+}
+
 #ifdef CONFIG_ADC_ADS1X4S0X_PIO_GPIO
 static int ads1x4s0x_pio_gpio_write_config(const struct device *dev)
 {
