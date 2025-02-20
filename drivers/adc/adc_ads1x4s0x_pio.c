@@ -274,6 +274,11 @@ static int spi_pico_pio_transceive(const struct device *dev,
     size_t rx_len = len;
     int rc = 0;
 
+    if (data->bulk_read_sm_running) {
+        LOG_ERR("%s: pio bulk read is running", dev->name);
+        return -EINVAL;
+    }
+
     rc = spi_pico_pio_configure(dev_cfg, data);
     if (rc < 0) {
         return rc;
@@ -1230,6 +1235,26 @@ static int ads1x4s0x_pio_make_channel_setup(const struct device *dev,
     return 0;
 }
 
+static int ads1x4s0x_pio_make_channel_setup_enable_continuous(const struct device *dev,
+        const struct adc_channel_cfg *channel_cfg,
+        enum ads1x4s0x_pio_register *register_addresses,  // length is 7
+        uint8_t *values)   // length is 7
+{
+    int result;
+
+    result = ads1x4s0x_pio_make_channel_setup(dev, channel_cfg, register_addresses, values);
+
+    if (result != 0) {
+        return result;
+    }
+
+    __ASSERT(register_addresses[2] == ADS1X4S0X_REGISTER_DATARATE, "wrong register order");
+
+    ADS1X4S0X_REGISTER_DATARATE_MODE_SET(values[2], 0);
+
+    return 0;
+}
+
 static int ads1x4s0x_pio_channel_setup(const struct device *dev,
         const struct adc_channel_cfg *channel_cfg)
 {
@@ -1584,6 +1609,29 @@ static int ads1x4s0x_pio_prepare_bulk_read_sm_insts(
     uint8_t multi_write_start_ind;
     uint8_t multi_write_cnt;
 
+    /* if there is only one channel, then there is no need to reconfig */
+    if (pio_cfg->chan_count == 1) {
+        result = ads1x4s0x_pio_make_channel_setup_enable_continuous(dev,
+                &pio_cfg->chan_cfgs[0], register_addresses, prev_values);
+
+        if (result != 0) {
+            return result;
+        }
+
+        for (int r = 0; r < pio_cfg->sample_count; ++r) {
+            pio_spi_odm_inst_do_wait(sm_raw_pgm);
+
+            pio_spi_odm_inst_do_tx_rx(sm_raw_pgm, 0x00, true);
+            pio_spi_odm_inst_do_tx_rx(sm_raw_pgm, 0x00, true);
+            pio_spi_odm_inst_do_tx_rx(sm_raw_pgm, 0x00, true);
+            pio_spi_odm_inst_do_tx_rx(sm_raw_pgm, 0x00, true);
+        }
+
+        pio_spi_odm_inst_finalize(sm_raw_pgm);
+
+        return 0;
+    }
+
     result = ads1x4s0x_pio_make_channel_setup(dev,
             &pio_cfg->chan_cfgs[pio_cfg->chan_count-1], register_addresses, prev_values);
 
@@ -1836,8 +1884,14 @@ int ads1x4s0x_pio_bulk_read_start(const struct device *dev)
     }
     gpio_pin_set_dt(&config->gpio_cs, GPIO_OUTPUT_ACTIVE);
 
-    result = ads1x4s0x_pio_make_channel_setup(dev, &bdata->current_pio_cfg->chan_cfgs[0],
-            register_addresses, values);
+    if (bdata->current_pio_cfg->chan_count == 1) {
+        result = ads1x4s0x_pio_make_channel_setup_enable_continuous(dev,
+                &bdata->current_pio_cfg->chan_cfgs[0],
+                register_addresses, values);
+    } else {
+        result = ads1x4s0x_pio_make_channel_setup(dev, &bdata->current_pio_cfg->chan_cfgs[0],
+                register_addresses, values);
+    }
 
     if (result != 0) {
         return result;
@@ -1851,6 +1905,15 @@ int ads1x4s0x_pio_bulk_read_start(const struct device *dev)
         return result;
     }
 
+    if (bdata->current_pio_cfg->chan_count == 1) {
+        result = ads1x4s0x_pio_send_command(dev, ADS1X4S0X_COMMAND_START);
+
+        if (result != 0) {
+            LOG_ERR("%s: unable to start sampling", dev->name);
+            return result;
+        }
+    }
+
     data->bulk_read_sm_running = true;
 
     dma_start_channel_mask((1u << config->dma_chan_cfg.rx1) | (1u << config->dma_chan_cfg.tx_ctrl1));
@@ -1862,6 +1925,8 @@ int ads1x4s0x_pio_bulk_read_stop(const struct device *dev)
 {
     const struct ads1x4s0x_pio_config *config = dev->config;
     struct ads1x4s0x_pio_data *data = dev->data;
+    struct ads1x4s0x_pio_bulk_read_data *bdata = &data->bulk_read_data;
+    int result;
 
     if (!data->bulk_read_sm_running) {
         LOG_ERR("%s: bulk read is not running", dev->name);
@@ -1884,9 +1949,18 @@ int ads1x4s0x_pio_bulk_read_stop(const struct device *dev)
         k_sleep(K_MSEC(1));
     }
 
-    gpio_pin_set_dt(&config->gpio_cs, GPIO_OUTPUT_INACTIVE);
-
     data->bulk_read_sm_running = false;
+
+    if (bdata->current_pio_cfg->chan_count == 1) {
+        result = ads1x4s0x_pio_send_command(dev, ADS1X4S0X_COMMAND_STOP);
+
+        if (result != 0) {
+            LOG_ERR("%s: unable to stop sampling", dev->name);
+            return result;
+        }
+    }
+
+    gpio_pin_set_dt(&config->gpio_cs, GPIO_OUTPUT_INACTIVE);
 
     return 0;
 }
