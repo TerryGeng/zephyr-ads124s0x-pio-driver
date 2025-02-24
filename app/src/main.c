@@ -1,7 +1,4 @@
-#include <inttypes.h>
-#include <stddef.h>
-#include <stdint.h>
-
+#include <stdlib.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
@@ -147,7 +144,7 @@ int main(void)
 }
 
 static int cmd_acq_start(const struct shell *sh, size_t argc,
-			      char **argv, uint32_t period)
+			      char **argv)
 {
 	ARG_UNUSED(argv);
 
@@ -171,9 +168,32 @@ static int cmd_acq_stop(const struct shell *sh, size_t argc,
 	return 0;
 }
 
+static int cmd_acq_datarate(const struct shell *sh, size_t argc,
+			      char **argv)
+{
+    unsigned long datarate;
+    char* end_ptr;
+
+    datarate = strtoul(argv[1], &end_ptr, 0);
+    if (*end_ptr != '\0' || datarate > 15) {
+        LOG_ERR("Unrecognized argument.");
+
+        return -1;
+    }
+
+    for (uint8_t i = 0; i < ARRAY_SIZE(adc_channels); i++) {
+        channel_cfgs[i].acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_TICKS, datarate);
+    }
+
+    LOG_INF("Data rate set to %lu.", datarate);
+
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_acq_cmd,
 	SHELL_CMD_ARG(start, NULL, "Start acquisition", cmd_acq_start, 1, 0),
 	SHELL_CMD_ARG(stop, NULL, "Stop acquisition.", cmd_acq_stop, 1, 0),
+	SHELL_CMD_ARG(datarate, NULL, "Set acquisition data rate from 0 to 15.", cmd_acq_datarate, 2, 0),
 	SHELL_SUBCMD_SET_END /* Array terminated. */
 );
 
