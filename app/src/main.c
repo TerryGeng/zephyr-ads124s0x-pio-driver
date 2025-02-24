@@ -38,7 +38,6 @@ const struct adc_dt_spec adc_channels[] = {
 
 struct adc_channel_cfg channel_cfgs[ARRAY_SIZE(adc_channels)];
 
-#define ADS1X4S0X_RESOLUTION 24
 #define REPEAT_CNT 5
 
 uint32_t sample_buf1[ARRAY_SIZE(adc_channels)*REPEAT_CNT];
@@ -59,6 +58,12 @@ struct ads1x4s0x_pio_bulk_read_config br_cfg = {
     .sample_buf_2 = (uint8_t *)sample_buf2,
 };
 
+#define THREAD_PRIORITY 8
+
+static struct k_thread sample_buffer_handler_thread;
+
+K_THREAD_STACK_DEFINE(sample_buffer_handler_stack, 512);
+
 static void print_buffer(const struct interleaving_channel_buf *buf, size_t len, bool verbose) {
     int32_t sample;
     uint8_t crc;
@@ -70,7 +75,7 @@ static void print_buffer(const struct interleaving_channel_buf *buf, size_t len,
         }
 
         for (int i = 0; i < ARRAY_SIZE(adc_channels); ++i) {
-            crc = (buf[j].channel_sample[i] >> ADS1X4S0X_RESOLUTION) & 0xFF;
+            crc = (buf[j].channel_sample[i] >> adc_channels[i].resolution) & 0xFF;
             sample = ads1x4s0x_pio_sample_to_int(dev, buf[j].channel_sample[i]);
 
             if (verbose) {
@@ -84,11 +89,20 @@ static void print_buffer(const struct interleaving_channel_buf *buf, size_t len,
     }
 }
 
-int main(void)
-{
+void sample_ready_thread_handler(void *ptr1, void *ptr2, void *ptr3) {
     uint8_t buf_ind;
     uint32_t *buf;
 
+    while (ads1x4s0x_pio_bulk_read_get_samples_blocking(dev, &buf_ind)) {
+        LOG_INF("DMA returned, buffer %d is ready", buf_ind);
+        buf = buf_ind == 1 ? sample_buf1 : sample_buf2;
+        gpio_pin_set_dt(&led, buf_ind % 2);
+        print_buffer((struct interleaving_channel_buf *)buf, REPEAT_CNT, true);
+    }
+}
+
+int main(void)
+{
     if (!gpio_is_ready_dt(&led)) {
         return 0;
     }
@@ -108,7 +122,6 @@ int main(void)
     gpio_pin_set_dt(&led, 1);
     gpio_pin_set_dt(&ads_gpio0, 1);
 
-    /* Configure channels individually prior to sampling. */
     for (size_t i = 0U; i < ARRAY_SIZE(adc_channels); i++) {
         if (!adc_is_ready_dt(&adc_channels[i])) {
             LOG_ERR("ADC controller device %s not ready\n", adc_channels[i].dev->name);
@@ -120,15 +133,15 @@ int main(void)
         memcpy(&channel_cfgs[i], &adc_channels[i].channel_cfg, sizeof(struct adc_channel_cfg));
     }
 
-    /*ads1x4s0x_pio_bulk_read_setup(dev, &br_cfg);*/
-    /*ads1x4s0x_pio_bulk_read_start(dev);*/
-
-    while (ads1x4s0x_pio_bulk_read_get_samples_blocking(dev, &buf_ind)) {
-        LOG_INF("DMA returned, buffer %d is ready", buf_ind);
-        buf = buf_ind == 1 ? sample_buf1 : sample_buf2;
-        gpio_pin_set_dt(&led, buf_ind % 2);
-        print_buffer((struct interleaving_channel_buf *)buf, REPEAT_CNT, true);
-    }
+    k_thread_create(
+            &sample_buffer_handler_thread,
+            sample_buffer_handler_stack,
+            K_THREAD_STACK_SIZEOF(sample_buffer_handler_stack),
+            sample_ready_thread_handler,
+            0, 0, 0,
+            THREAD_PRIORITY,
+            0,
+            K_NO_WAIT);
 
     return 0;
 }
